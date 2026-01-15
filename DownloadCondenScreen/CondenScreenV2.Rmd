@@ -30,7 +30,9 @@ required_packages <- c(
   "plotly",
   "htmltools",
   "sass",
-  "rlang"
+  "rlang",
+  "gridExtra"
+
 )
 
 installed <- rownames(installed.packages())
@@ -328,6 +330,9 @@ server <- function(input, output, session) {
 # Run app
 shinyApp(ui = ui, server = server)
 
+
+
+
 ```
 
 
@@ -336,6 +341,7 @@ shinyApp(ui = ui, server = server)
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 save_Location <- "/home/userX/pathsource/"
+save_Location <- "/Users/dylan/Downloads/"
 #############################################################
 
 dfSelection <-  fread(paste0(save_Location, "well_selection.csv"))
@@ -357,6 +363,12 @@ file_Location <- add_trailing_slash(dfSelection$InputDirectory[1])
 assayType <- dfSelection$SignalStatus[1]
 pos_Ctrl <- dfSelection$PositiveControlName[1]
 neg_Ctrl <- dfSelection$NegativeControlName[1]
+
+rows <- dfSelection$PlateRows[1]
+cols <- dfSelection$PlateCols[1]
+plateSize <- dfSelection$PlateWells[1]
+ChemVGene <- dfSelection$ScreenType[1]
+
 trial_Name <- paste("Plate", sep = " ")
 
 #Edit: Change string parsing to match the specific naming convention you used while naming the CellProfiler output
@@ -737,7 +749,6 @@ combined_Df <- merge(combined_Df, temp_stats_Df, all = TRUE)
 ```{r}
 # EXPORT PLATE FIGURES (OPTIONAL, CAN COMMENT OUT) 
 #------------------------------------------------------------------------------
-library(gridExtra)
 
 # Define path
 sub_dir <- paste0(file_Location,"Plate_Figures/") 
@@ -759,7 +770,7 @@ for (plate in seq_len(length(unique(combined_Df$plate_Num)))){
     data = sub_df,
     position = Well_Num,
     value = Avg_Foci,
-    plate_size = 384,
+    plate_size = plateSize,
     label = round(Avg_Foci, 0),
     title = paste(plate_List[plate], ", Avg. Foci/Condition:", sep = ""),
     title_size = 14,
@@ -773,7 +784,7 @@ for (plate in seq_len(length(unique(combined_Df$plate_Num)))){
     data = sub_df,
     position = Well_Num,
     value = Nuclei_Number,
-    plate_size = 384,
+    plate_size = plateSize,
     label = round(Nuclei_Number),
     title = paste(plate_List[plate], ", Avg. Cell Count/Condition:", sep = ""),
     title_size = 14,
