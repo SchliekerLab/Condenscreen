@@ -1,9 +1,11 @@
 ---
 title: "CondenScreen R Script"
 output: html_notebook
+author: Dylan Poch
 ---
 
 Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
 
 ```{r}
 #PACKAGES
@@ -24,64 +26,86 @@ for (pkg in required_packages) {
     message("Installing package: ", pkg)
     install.packages(pkg, dependencies = TRUE)
   }
+  suppressPackageStartupMessages(
   library(pkg, character.only = TRUE)
+  )
 }
 ```
 
 ```{r}
 # CondenScreen GUI 
 #------------------------------------------------------------------------------
-  
+
 # Function to generate well coordinates
 generate_well_coordinates <- function(rows, cols) {
   expand.grid(Row = LETTERS[1:rows], Col = 1:cols) %>%
-    mutate(Well = paste0(Row, sprintf("%02d", Col)))
+    mutate(
+      Col = as.integer(Col),
+      Well = paste0(Row, sprintf("%02d", Col)),
+      Condition = "None"
+    )
 }
 
-# Define UI
+# ---------------------------
+# UI
+# ---------------------------
 ui <- fluidPage(
   titlePanel("CondenScreen Well Selection:"),
   sidebarLayout(
     sidebarPanel(
-      selectInput("plate_type", "Select Plate Type:", 
-                  choices = c("6-well" = "2x3", "12-well" = "3x4", "24-well" = "4x6", 
-                              "96-well" = "8x12", "384-well" = "16x24")),
-      
-      radioButtons("condition", "Select Condition:", 
-                   choices = c("Positive Control", "Negative Control", "Test Condition")),
-      
+      selectInput(
+        "plate_type", "Select Plate Type:",
+        choices = c(
+          "6-well"   = "2x3",
+          "12-well"  = "3x4",
+          "24-well"  = "4x6",
+          "96-well"  = "8x12",
+          "384-well" = "16x24"
+        )
+      ),
+
+      radioButtons(
+        "condition", "Select Condition:",
+        choices = c("Positive Control", "Negative Control", "Test Condition", "Unselect")
+      ),
+
       textInput("pos_control_name", "Positive Control Name:", value = "Positive Ctrl"),
       textInput("neg_control_name", "Negative Control Name:", value = "Negative Ctrl"),
-      
+
+      # NEW: Chemical vs Genetic screen toggle (button)
+      actionButton("screen_toggle", "Screen: Chemical", style = "width: 100%"),
+
+      # Existing: signal toggle
       actionButton("signal_toggle", "Signal: OFF", style = "width: 100%"),
+
       actionButton("clear", "Clear Selections"),
       hr(),
-      
-      # Interactive save directory selection
+
       strong("Save Directory:"),
-      div(style = "display: flex; margin-bottom: 10px;",
-          textInput("save_dir", NULL, value = paste0(getwd(), "/"), width = "100%")),
-  
-      
-      textInput("save_filename", "Save File Name: (end with .csv; Final analysis will be in YOURFILENAME_results.csv)", value = "well_selection.csv"),
-      
-      # Interactive input directory selection
-      strong("Input Directory:"),
-      div(style = "display: flex; margin-bottom: 10px;",
-          textInput("input_dir", NULL, value = paste0(getwd(), "/"), width = "100%"),
-          actionButton("parent_input_dir", "↑", style = "margin-left: 5px;"),
-          actionButton("reset_input_dir", "Reset", style = "margin-left: 5px;")
+      div(
+        style = "display: flex; margin-bottom: 10px;",
+        textInput("save_dir", NULL, value = paste0(getwd(), "/"), width = "100%")
       ),
-      
+
+      textInput(
+        "save_filename",
+        "Save File Name: (end with .csv; Final analysis will be in YOURFILENAME_results.csv)",
+        value = "well_selection.csv"
+      ),
+
+      strong("Input Directory:"),
+      div(
+        style = "display: flex; margin-bottom: 10px;",
+        textInput("input_dir", NULL, value = paste0(getwd(), "/"), width = "100%"),
+        actionButton("parent_input_dir", "↑", style = "margin-left: 5px;"),
+        actionButton("reset_input_dir", "Reset", style = "margin-left: 5px;")
+      ),
+
       hr(),
-      
       downloadButton("download", "Download Selection"),
-      
-      # Show subdirectories in the current save directory
-      # strong("Available subdirectories:"),
-      # uiOutput("subdirectories")
+      actionButton("exit_app", "Exit", class = "btn-danger", style = "width: 100%;")
     ),
-    
+
     mainPanel(
       plotlyOutput("plate_plot"),
       tableOutput("selected_wells")
@@ -89,263 +113,204 @@ ui <- fluidPage(
   )
 )
 
-# Define server logic
+# ---------------------------
+# SERVER
+# ---------------------------
 server <- function(input, output, session) {
-  
-  # Reactive values for directories
+
+  # Reactive values for directories (metadata)
   save_dir <- reactiveVal(getwd())
   input_dir <- reactiveVal(file.path(getwd(), "data"))
-  
-  # Update save_dir when text input changes
+
   observeEvent(input$save_dir, {
-    if (dir.exists(input$save_dir)) {
-      save_dir(input$save_dir)
-    }
+    if (dir.exists(input$save_dir)) save_dir(input$save_dir)
   })
-  
-  # Update input_dir when text input changes
+
   observeEvent(input$input_dir, {
-    if (dir.exists(input$input_dir)) {
-      input_dir(input$input_dir)
-    }
+    if (dir.exists(input$input_dir)) input_dir(input$input_dir)
   })
-  
-  # Go to parent directory (save)
-  observeEvent(input$parent_dir, {
-    current <- save_dir()
-    parent <- dirname(current)
-    save_dir(parent)
-    updateTextInput(session, "save_dir", value = parent)
-  })
-  
-  # Go to home directory (save)
-  observeEvent(input$home_dir, {
-    home <- path.expand("~")
-    save_dir(home)
-    updateTextInput(session, "save_dir", value = home)
-  })
-  
-  # Go to parent directory (input)
+
   observeEvent(input$parent_input_dir, {
     current <- input_dir()
     parent <- dirname(current)
     input_dir(parent)
     updateTextInput(session, "input_dir", value = parent)
   })
-  
-  # Reset input directory
+
   observeEvent(input$reset_input_dir, {
     default <- file.path(getwd(), "data")
     input_dir(default)
     updateTextInput(session, "input_dir", value = default)
   })
-  
-  # List subdirectories for selection
-  output$subdirectories <- renderUI({
-    current_dir <- save_dir()
-    if (!dir.exists(current_dir)) return(NULL)
-    
-    # Get all subdirectories
-    dirs <- list.dirs(current_dir, full.names = FALSE, recursive = FALSE)
-    # Remove hidden directories (starting with .)
-    dirs <- dirs[!grepl("^\\.", dirs)]
-    
-    if (length(dirs) == 0) {
-      return(p("No subdirectories found"))
-    }
-    
-    # Create buttons for each subdirectory
-    tagList(
-      div(style = "max-height: 150px; overflow-y: auto;",
-          lapply(dirs, function(dir) {
-            actionButton(
-              inputId = paste0("dir_", gsub("[^a-zA-Z0-9]", "_", dir)),
-              label = dir,
-              style = "margin: 2px; display: block; width: 100%; text-align: left;",
-              onclick = sprintf(
-                "Shiny.setInputValue('select_subdir', '%s');",
-                file.path(current_dir, dir)
-              )
-            )
-          })
-      )
-    )
-  })
-  
-  # Handle subdirectory selection
-  observeEvent(input$select_subdir, {
-    if (dir.exists(input$select_subdir)) {
-      save_dir(input$select_subdir)
-      updateTextInput(session, "save_dir", value = input$select_subdir)
-    }
-  })
-  
-  # Reactive plate dimensions
+
+  # Plate dimensions
   plate_dims <- reactive({
     dims <- strsplit(input$plate_type, "x")[[1]]
-    list(rows = as.numeric(dims[1]), cols = as.numeric(dims[2]))
+    list(rows = as.integer(dims[1]), cols = as.integer(dims[2]))
   })
-  
-  # Reactive well coordinates
-  well_data <- reactiveVal(data.frame(Well = character(), Condition = character()))
-  
-  # Global dataframe for storing selected wells
-  selected_wells_global <- reactiveVal(data.frame(Well = character(), Condition = character()))
-  
-  # Generate plate layout
+
+  # Main data store
+  well_data <- reactiveVal(data.frame(Row = character(), Col = integer(), Well = character(), Condition = character()))
+
+  # Initialize / regenerate on plate type changes
   observeEvent(input$plate_type, {
     dims <- plate_dims()
     df <- generate_well_coordinates(dims$rows, dims$cols)
-    df$Condition <- "None"
-    isolate(well_data(df))
-  })
-  
-  # Initialize the plate layout when the app starts
+    well_data(df)
+  }, ignoreInit = TRUE)
+
   observe({
-    # This will trigger once when the app starts
-    if(nrow(well_data()) == 0) {
+    if (nrow(well_data()) == 0) {
       dims <- plate_dims()
       df <- generate_well_coordinates(dims$rows, dims$cols)
-      df$Condition <- "None"
       well_data(df)
     }
   })
-  
-  # Signal ON/OFF toggle
+
+  # Chemical vs Genetic toggle
+  screen_type <- reactiveVal("Chemical")
+  observeEvent(input$screen_toggle, {
+    screen_type(ifelse(screen_type() == "Chemical", "Genetic", "Chemical"))
+    updateActionButton(session, "screen_toggle", label = paste0("Screen: ", screen_type()))
+  })
+
+  # Signal toggle
   signal_status <- reactiveVal(FALSE)
-  
   observeEvent(input$signal_toggle, {
-    signal_status(!signal_status())  # Toggle state
-    updateActionButton(session, "signal_toggle", 
+    signal_status(!signal_status())
+    updateActionButton(session, "signal_toggle",
                        label = ifelse(signal_status(), "Signal: ON", "Signal: OFF"))
   })
-  
-  # Render plate plot
+
+  # Map UI condition to internal label
+  normalize_condition <- function(cond) {
+    if (identical(cond, "Unselect")) return("None")
+    cond
+  }
+
+  # Plot
   output$plate_plot <- renderPlotly({
     df <- well_data()
-    
-    plot_ly(df,
-            x = ~factor(Col, levels = unique(Col)),
-            y = ~factor(Row, levels = rev(unique(Row))),
-            type = "scatter",
-            mode = "markers",
-            marker = list(size = 15, color = ~case_when(
-              Condition == "Positive Control" ~ "green",
-              Condition == "Negative Control" ~ "red",
-              Condition == "Test Condition" ~ "black",
-              TRUE ~ "gray"
-            )),
-            source = "plateplot") %>%
+
+    plot_ly(
+      df,
+      x = ~factor(Col, levels = sort(unique(Col))),
+      y = ~factor(Row, levels = rev(unique(Row))),
+      type = "scatter",
+      mode = "markers",
+      key = ~Well,  # <<< CRITICAL: stable identity so click/select never maps to wrong well
+      marker = list(
+        size = 15,
+        color = ~case_when(
+          Condition == "Positive Control" ~ "green",
+          Condition == "Negative Control" ~ "red",
+          Condition == "Test Condition" ~ "black",
+          TRUE ~ "gray"
+        )
+      ),
+      source = "plateplot"
+    ) %>%
       layout(
-        xaxis = list(title = "Column", tickmode = "array",
-                     tickvals = unique(df$Col), ticktext = unique(df$Col)),
-        yaxis = list(title = "Row", tickmode = "array",
-                     tickvals = unique(df$Row), ticktext = rev(unique(df$Row)) ),
+        xaxis = list(title = "Column"),
+        yaxis = list(title = "Row"),
         showlegend = FALSE,
         dragmode = "select"
       )
   })
-  
-  # Handle multiple well selection
+
+  # Box select: use key (Well) not x/y
   observeEvent(event_data("plotly_selected", source = "plateplot"), {
     selected_data <- event_data("plotly_selected", source = "plateplot")
-    if (is.null(selected_data)) return()
-    
+    if (is.null(selected_data) || is.null(selected_data$key)) return()
+
     df <- well_data()
-    
-    for(i in 1:nrow(selected_data)) {
-      row <- as.character(selected_data$y[i])
-      col <- as.numeric(selected_data$x[i])
-      matching_wells <- df$Well[df$Row == row & df$Col == col]
-      df$Condition[df$Well %in% matching_wells] <- input$condition
-    }
-    
+    new_cond <- normalize_condition(input$condition)
+    wells_clicked <- as.character(selected_data$key)
+
+    df$Condition[df$Well %in% wells_clicked] <- new_cond
     well_data(df)
-    
-    # Update global dataframe
-    selected_wells_global(df %>% filter(Condition != "None"))
   })
-  
-  # Handle single click selection
-    observeEvent(event_data("plotly_click", source = "plateplot"), {
+
+  # Click select: use key (Well) not x/y
+  observeEvent(event_data("plotly_click", source = "plateplot"), {
     click_data <- event_data("plotly_click", source = "plateplot")
-    if (is.null(click_data)) return()
-    
+    if (is.null(click_data) || is.null(click_data$key)) return()
+
     df <- well_data()
-    well <- df$Well[df$Row == as.character(click_data$y) & df$Col == as.numeric(click_data$x)]
-    df$Condition[df$Well == well] <- input$condition
+    new_cond <- normalize_condition(input$condition)
+    well_clicked <- as.character(click_data$key)
+
+    df$Condition[df$Well == well_clicked] <- new_cond
     well_data(df)
-
-    # Update global dataframe
-    selected_wells_global(df %>% filter(Condition != "None"))
   })
-    
-  # Display selected wells
+
+  # Table (with renamed controls)
   output$selected_wells <- renderTable({
-    well_data() %>% 
+    well_data() %>%
       mutate(Condition = case_when(
         Condition == "Positive Control" ~ input$pos_control_name,
         Condition == "Negative Control" ~ input$neg_control_name,
-        Condition == "None" ~ NA,
-
+        Condition == "None" ~ NA_character_,
         TRUE ~ Condition
       ))
   })
-  
-  # Download selected wells
+
+  # Download: includes plate dims + screen type
   output$download <- downloadHandler(
-  filename = function() {
-    input$save_filename
-  },
-  content = function(file) {
-    df <- well_data() %>%
-      mutate(Condition = case_when(
-        Condition == "Positive Control" ~ input$pos_control_name,
-        Condition == "Negative Control" ~ input$neg_control_name,
-        Condition == "None" ~ NA,
-        TRUE ~ Condition
-      ))
-    
-    # Create a dataframe for the settings
-    settings_df <- data.frame(
-      SaveDirectory = save_dir(),
-      InputDirectory = input_dir(),
-      SignalStatus = ifelse(signal_status(), "ON", "OFF"),
-      PositiveControlName = input$pos_control_name,
-      NegativeControlName = input$neg_control_name,
-      stringsAsFactors = FALSE
-    )
-    
-    # Combine settings with well data
-    final_df <- cbind(settings_df, df)
-    
-    # Create the target directory if it doesn't exist
-    target_dir <- save_dir()
-    if (!dir.exists(target_dir)) {
-      dir.create(target_dir, recursive = TRUE, showWarnings = FALSE)
+    filename = function() input$save_filename,
+    content = function(file) {
+
+      df <- well_data() %>%
+        mutate(Condition = case_when(
+          Condition == "Positive Control" ~ input$pos_control_name,
+          Condition == "Negative Control" ~ input$neg_control_name,
+          Condition == "None" ~ NA_character_,
+          TRUE ~ Condition
+        ))
+
+      dims <- plate_dims()
+
+      settings_df <- data.frame(
+        PlateType = input$plate_type,         # e.g. "16x24"
+        PlateRows = dims$rows,
+        PlateCols = dims$cols,
+        PlateWells = dims$rows * dims$cols,
+
+        ScreenType = screen_type(),           # "Chemical" / "Genetic"
+        SaveDirectory = save_dir(),           # metadata
+        InputDirectory = input_dir(),         # metadata
+        SignalStatus = ifelse(signal_status(), "ON", "OFF"),
+        PositiveControlName = input$pos_control_name,
+        NegativeControlName = input$neg_control_name,
+        stringsAsFactors = FALSE
+      )
+
+      final_df <- cbind(settings_df, df)
+
+      # (Optional) create SaveDirectory on disk, but the browser download won't use it.
+      target_dir <- save_dir()
+      if (!dir.exists(target_dir)) dir.create(target_dir, recursive = TRUE, showWarnings = FALSE)
+
+      write.csv(final_df, file, row.names = FALSE)
     }
-    
-    # Write to the specified path
-    write.csv(final_df, file, row.names = FALSE) 
-  }
-)
+  )
+
   # Clear selections
   observeEvent(input$clear, {
     df <- well_data()
     df$Condition <- "None"
     well_data(df)
-    
-    # Clear global dataframe
-    selected_wells_global(data.frame(Well = character(), Condition = character()))
   })
-  
-  # Clean up when session ends
-  session$onSessionEnded(function() {
+
+  # Exit button
+  observeEvent(input$exit_app, {
     stopApp()
   })
+
+  session$onSessionEnded(function() stopApp())
 }
 
-# Run the application 
+# Run app
 shinyApp(ui = ui, server = server)
 ```
 
@@ -355,8 +320,8 @@ shinyApp(ui = ui, server = server)
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 #save_Location <- "/home/userX/pathsource/"
-save_Location <- "/Users/dylan/Downloads/pharmakon 2/"
-file_Location<- "/Users/dylan/Downloads/pharmakon 2/"
+save_Location <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/"
+file_Location<- save_Location
 #############################################################
 
 dfSelection <-  fread(paste0(save_Location, "well_selection.csv"))
@@ -396,7 +361,7 @@ file_paths <- list.files(file_Location, pattern="pharmakon", full.names=TRUE, re
 #############################################################
 
 # Check if the file exists
-path_to_batchScript <- paste0(file_Location, "process_batch.R")
+path_to_batchScript <- paste0(file_Location, "process_batchtdTomato.R")
 
 if (file.exists(path_to_batchScript)) {
   cat("The batch script exists. Success!\n")
@@ -413,7 +378,7 @@ stopifnot(total_files > 0)  # fail early instead of launching nothing
 
 total_batches <- ceiling(total_files / batch_size)
 
-script_path <- file.path(file_Location, "process_batch.R")
+script_path <- file.path(file_Location, "process_batchtdTomato.R")
 stopifnot(file.exists(script_path))
 
 for (i in 1:total_batches) {
@@ -518,7 +483,7 @@ combined_Df <- combined_data
 ```{r}
 # INDIVIDUAL CONDITION/CONTROL STATISTICS 
 #------------------------------------------------------------------------------
-#Filter out bottom 75% (to control for a transfection efficiency of 1:4)
+#[OPTIONAL] Filter out bottom 75% (to control for a transfection efficiency of 1:4)
 #Filter conditions that leave < 5 cells/image (too much variance for meaningful interpretation)
 combined_Df <- combined_Df %>%
   
@@ -692,104 +657,86 @@ temp_stats_Df <- temp_stats_Df %>%
 
 
 ```{r}
-
+# B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS) 
 #------------------------------------------------------------------------------
-# B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS)
-#------------------------------------------------------------------------------
-# Convert to matrix format for median polish algorithm
-# B-score normalizes for row/column effects in plates
-# BScore_func <- function(df) {
 
-BScore_func <- function(df) {
-  
-  temp_df <- df 
+BScore_func <- function(df, rows, cols,
+                        effect_col = "PercentChange",
+                        well_col   = "Well_Num") {
 
-  # Extract well coordinates (e.g., A01, B02, etc.)
-  letters = substr(temp_df$Well_Num, 1, 1)  # Row (A, B, C...)
-  numbers = as.numeric(substr(temp_df$Well_Num, 2, 
-                               nchar(as.character(temp_df$Well_Num))))  # Column (1, 2, 3...)
-  
-  # Get unique row and column values
-  unique_letters = unique(letters)
-  unique_numbers = unique(numbers)
-  
-  # Create empty matrix with proper dimensions
-  mtx = matrix(NA, 
-                nrow = length(unique_letters), 
-                ncol = length(unique_numbers), 
-                dimnames = list(unique_letters, unique_numbers))
-  
-  # Fill matrix with normalized effect values
-  for (i in 1:nrow(temp_df)) {
-    row_index <- match(letters[i], rownames(mtx))
-    col_index <- match(numbers[i], colnames(mtx))
-    mtx[row_index, col_index] <- as.numeric(temp_df$PercentChange[i])
+  temp_df <- df
+
+  # Full plate indexing
+  row_levels <- LETTERS[1:rows]
+  col_levels <- 1:cols
+
+  # Parse wells like A01, B12, etc.
+  well <- as.character(temp_df[[well_col]])
+  r <- substr(well, 1, 1)
+  cnum <- suppressWarnings(as.integer(sub("^[A-Za-z]+", "", well)))
+
+  keep <- !is.na(r) & !is.na(cnum) & r %in% row_levels & cnum %in% col_levels
+  if (!any(keep)) {
+    return(dplyr::tibble(Well_Num = character(0), BScore = numeric(0), BZ_Score = numeric(0)))
   }
-  
-  # See: https://academic.oup.com/bioinformatics/article/28/13/1775/235775
-  # and: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4653387/
-  
-  #Replaces NAs that would crash the code with median values of plate, if applicable.
-  bScore <- tryCatch({
-  mtx_Polish <- medpolish(mtx)
-  residuals <- mtx_Polish$residuals
-  
-  # Calculate median absolute deviation for scaling
-  MAD <- mad(residuals, constant = 1)
-  
-  # Calculate B-score = residuals / MAD
-  residuals / MAD
-   
-}, error = function(e) {
-  
-  # Fallback if medpolish fails
-  num_NA <- length(mtx[is.na(mtx)])
-  message(paste0("B-score calculation failed for this plate, replacing ", num_NA, " NA's with plate median... Trying again."))
-  mtx_mean <- mean(mtx, na.rm = TRUE)
-  mtx[is.na(mtx)] <- mtx_mean
-  
-  mtx_Polish <- medpolish(mtx)
-  residuals <- mtx_Polish$residuals
-  
-  # Calculate median absolute deviation for scaling
-  MAD <- mad(residuals, constant = 1)
-  
-  # Calculate B-score = residuals / MAD
-  residuals / MAD
-   
-}) 
-  
-  # Convert matrix back to dataframe
-  row_names <- rownames(bScore)
-  col_names <- colnames(bScore)
-  BScoreDf <- data.frame(Well_Condition = character(), BScore = numeric())
-  
-  # Process each element in the matrix
-  for (i in 1:nrow(bScore)) {
-    for (j in 1:ncol(bScore)) {
-      if (!is.na(bScore[i, j])) {
-        # Format well ID with leading zeros for column numbers (A01, A02...)
-        Well_Condition <- paste0(row_names[i], sprintf("%02d", as.numeric(col_names[j])))
-        # Add to dataframe
-        BScoreDf <- rbind(BScoreDf, 
-                          data.frame(Well_Num = Well_Condition, 
-                                     BScore = bScore[i, j]))
-      }
-    }
-  }
-  
-  
-  # Calculate B-score statistics
-  avg_B <- mean(BScoreDf$BScore)
-  SD_B <- sd(BScoreDf$BScore)
-  
-  # Calculate B-score Z-scores for hit identification
-  BScoreDf$BZ_Score <- (BScoreDf$BScore - avg_B) / SD_B
-  
-  original_wells <- unique(temp_df$Well_Num)
-  BScoreDf <- BScoreDf %>% filter(Well_Num %in% original_wells)
+
+  # Build full plate matrix
+  mtx <- matrix(NA_real_, nrow = rows, ncol = cols,
+                dimnames = list(row_levels, as.character(col_levels)))
+
+  eff <- suppressWarnings(as.numeric(temp_df[[effect_col]]))
+
+  # Fill matrix (vectorized)
+  mtx[cbind(match(r[keep], row_levels), match(cnum[keep], col_levels))] <- eff[keep]
+
+  # Median polish + MAD scaling (B-score)
+  bmat <- tryCatch({
+    mp <- stats::medpolish(mtx, trace.iter = FALSE)
+    resid <- mp$residuals
+    MAD <- stats::mad(resid, constant = 1, na.rm = TRUE)
+    if (is.na(MAD) || MAD == 0) MAD <- 1
+    resid / MAD
+  }, error = function(e) {
+    # Fallback: impute missing with plate median and retry
+    fill <- stats::median(mtx, na.rm = TRUE)
+    if (is.na(fill)) fill <- 0
+    mtx[is.na(mtx)] <- fill
+
+    mp <- stats::medpolish(mtx, trace.iter = FALSE)
+    resid <- mp$residuals
+    MAD <- stats::mad(resid, constant = 1, na.rm = TRUE)
+    if (is.na(MAD) || MAD == 0) MAD <- 1
+    resid / MAD
+  })
+
+  # Convert to tibble for wells present in this df
+  out <- expand.grid(
+    Row = row_levels,
+    Col = col_levels,
+    stringsAsFactors = FALSE
+  )
+  out$Well_Num <- paste0(out$Row, sprintf("%02d", out$Col))
+  out$BScore   <- as.vector(bmat)
+
+  out <- dplyr::as_tibble(out) %>%
+    dplyr::filter(.data$Well_Num %in% unique(well[keep])) %>%
+    dplyr::select(.data$Well_Num, .data$BScore)
+
+  # BZ-score (within-plate normalization of B-score)
+  mu <- mean(out$BScore, na.rm = TRUE)
+  sdv <- stats::sd(out$BScore, na.rm = TRUE)
+  if (is.na(sdv) || sdv == 0) sdv <- 1
+
+  out <- out %>%
+    dplyr::mutate(BZ_Score = (.data$BScore - mu) / sdv)
+
+  out
 }
 
+# ---- RUN B-SCORE ONLY WHEN:
+# (1) assayType == "OFF" AND (2) plateSize >= 96
+# Should not use BZ-Score if plate size is smaller than 96 wells
+if (assayType == "OFF" && plateSize >= 96) {
 
 bs_res <- temp_stats_Df %>%
   filter(Condition == Well_Num) %>%
@@ -830,7 +777,6 @@ bs_res <- temp_stats_Df %>%
 ```{r}
 # EXPORT PLATE FIGURES (OPTIONAL, CAN COMMENT OUT) 
 #------------------------------------------------------------------------------
-library(gridExtra)
 
 # Define path
 sub_dir <- paste0(file_Location,"Plate_Figures/") 
@@ -852,7 +798,7 @@ for (plate in seq_len(length(unique(combined_Df$plate_Num)))){
     data = sub_df,
     position = Well_Num,
     value = Avg_Foci,
-    plate_size = 384,
+    plate_size = plateSize,
     label = round(Avg_Foci, 0),
     title = paste(plate_List[plate], ", Avg. Foci/Condition:", sep = ""),
     title_size = 14,
@@ -1096,6 +1042,7 @@ options(scipen = 999)
 
 # ------------- DATA LOADING AND PREPARATION -------------
 # Load workbook from predefined location (assuming save_Location is defined elsewhere)
+
 wb <- loadWorkbook(export_File)
 
 merged_df <- read.xlsx(wb, sheet = "Combined Analysis")
@@ -1362,7 +1309,7 @@ normalized_dist <- normalized_dist +
 # 1. CONFIGURATION
 # ============================================================
 #If not previously defined:
-fileX   <- "/Users/Downloads/Pharmakon 2/CondenScreenV2.xlsx"
+fileX   <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/CondenScreenV2.xlsx"
 
 export_File <- fileX
 sheetX  <- "Combined Analysis"
@@ -1995,6 +1942,9 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
 #Path to previously exported datasheet.
 #save_Location <- "/Users/dylan/Downloads/pharmakon 2/"
 
+#If not previously defined:
+fileX   <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/CondenScreenV2.xlsx"
+
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
 # ============================================================
@@ -2077,6 +2027,12 @@ sanitize_smiles <- function(smi) {
   smi <- gsub("[\t\r\n ]+", "", smi)
   smi <- gsub("\\|", ".", smi)
   smi
+}
+
+#Try parse SMILES into an RDKit molecule, else NULL
+safe_mol <- function(smi) {
+  if (is.na(smi) || !nzchar(trimws(smi))) return(NULL)
+  tryCatch(Chem$MolFromSmiles(trimws(smi)), error = function(e) NULL)
 }
 
 is_valid_smiles <- function(smi) {
@@ -2245,11 +2201,7 @@ rdMS <- import("rdkit.Chem.MolStandardize.rdMolStandardize")
 uncharger <- rdMS$Uncharger()
 largest_frag <- rdMS$LargestFragmentChooser()
 
-#Try parse SMILES into an RDKit molecule, else NULL
-safe_mol <- function(smi) {
-  if (is.na(smi) || !nzchar(trimws(smi))) return(NULL)
-  tryCatch(Chem$MolFromSmiles(trimws(smi)), error = function(e) NULL)
-}
+
 
 #Try to edit SMILES format to reflect canonical SMILES [avoids salt charges, keeps largest fragment, etc.]
 canonicalize_parent <- function(smiles) {
