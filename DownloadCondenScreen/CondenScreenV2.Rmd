@@ -320,7 +320,7 @@ shinyApp(ui = ui, server = server)
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 #save_Location <- "/home/userX/pathsource/"
-save_Location <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/"
+save_Location <-"/home/userX/pathsource/"
 file_Location<- save_Location
 #############################################################
 
@@ -510,7 +510,7 @@ combined_Df <- combined_Df %>%
   ungroup()
 
 #Combine with assigned conditions:
-# dfSelection <- dfSelection %>% rename(Well_Num = Well).
+dfSelection <- dfSelection %>% rename(Well_Num = Well)
 combined_Df <- merge(combined_Df, dfSelection[, c('SignalStatus', 'Condition', 'Well_Num')], by = "Well_Num")
 
 combined_Df <- combined_Df %>% 
@@ -1341,7 +1341,7 @@ normalized_dist <- normalized_dist +
 # 1. CONFIGURATION
 # ============================================================
 #If not previously defined:
-fileX   <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/CondenScreenV2.xlsx"
+fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
 
 export_File <- fileX
 sheetX  <- "Combined Analysis"
@@ -1970,10 +1970,10 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
 # Configuration
 # ============================================================
 #Path to previously exported datasheet.
-#save_Location <- "/Users/dylan/Downloads/pharmakon 2/"
+#save_Location <- "/home/userX/pathsource/"
 
 #If not previously defined:
-fileX   <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/CondenScreenV2.xlsx"
+fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
 
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
