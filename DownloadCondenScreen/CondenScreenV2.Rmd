@@ -1137,14 +1137,17 @@ wb <- loadWorkbook(export_File)
 if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
 #Order by BZ-Score (descending)
-hits_df <- hits_df %>% arrange(desc(BZScore))
+hits_df <- hits_df %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
+
 writeData(wb, sheet_hits, hits_df, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df))
 
 if (sheet_df %in% names(wb)) removeWorksheet(wb, sheet_df)
 addWorksheet(wb, sheet_df)
-merged_df2 <- merged_df2 %>% arrange(desc(BZScore))
+
+#Order by BZ-Score (descending)
+merged_df2 <- merged_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
 writeData(wb, sheet_df, merged_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_df, firstActiveRow = 2)
 addFilter(wb, sheet_df, rows = 1, cols = 1:ncol(merged_df2))
@@ -1965,7 +1968,7 @@ addWorksheet(wb, sheet_hits)
 
 
 #Order by BZ-Score (descending)
-hits_df2 <- hits_df2 %>% arrange(desc(BZScore))
+hits_df2 <- hits_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
 
 writeData(wb, sheet_hits, hits_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
@@ -2583,7 +2586,7 @@ if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
 
 #Order by BZ-Score (descending)
-df_final <- df_final %>% arrange(desc(BZScore))
+df_final <- df_final %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
 writeData(wb, sheet_hits, df_final, startCol = 1, startRow = 1, colNames = TRUE)
 
 freezePane(wb, sheet_hits, firstActiveRow = 2)
