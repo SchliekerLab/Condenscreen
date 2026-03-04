@@ -1787,6 +1787,7 @@ p_heat_hit <- heatmap_metric(
   "Total hits"
 ) +
   hit_impact_purple_deeper(max_hits = max_hits_well) +
+  scale_y_discrete(limits = rev) +
   theme(legend.position = "right")
 
 p_heat_z <- p_heat_z +
@@ -1794,7 +1795,8 @@ p_heat_z <- p_heat_z +
     title = "Heatmap: Median Z-Score by Well Position",
     fill  = "Median Z-Score"
   ) +
-  heatmap_theme_clean
+  heatmap_theme_clean +
+  scale_y_discrete(limits = rev) 
 
 if (has_bz) {
   p_heat_bz <- p_heat_bz +
@@ -1802,9 +1804,9 @@ if (has_bz) {
       title = "Heatmap: Median BZ-Score by Well Position",
       fill  = "Median BZ-Score"
     ) +
-    heatmap_theme_clean
-}
-
+    heatmap_theme_clean +
+  scale_y_discrete(limits = rev) 
+  }
 
 p_heat_hit <- p_heat_hit +
   labs(title = "Heatmap: Total Hits by Well Position") +
