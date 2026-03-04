@@ -320,7 +320,7 @@ shinyApp(ui = ui, server = server)
 #############################################################  
 #Make sure all pathways use foward slash (/)!
 #save_Location <- "/home/userX/pathsource/"
-save_Location <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/"
+save_Location <-"/home/userX/pathsource/"
 file_Location<- save_Location
 #############################################################
 
@@ -510,7 +510,7 @@ combined_Df <- combined_Df %>%
   ungroup()
 
 #Combine with assigned conditions:
-dfSelection <- dfSelection %>% rename(Well_Num = Well).
+dfSelection <- dfSelection %>% rename(Well_Num = Well)
 combined_Df <- merge(combined_Df, dfSelection[, c('SignalStatus', 'Condition', 'Well_Num')], by = "Well_Num")
 
 combined_Df <- combined_Df %>% 
@@ -518,22 +518,26 @@ combined_Df <- combined_Df %>%
   filter(complete.cases(Condition))
 
 #Calculate aggregate statistics for each condition:
-combined_Df<- combined_Df %>%
-          group_by(plate_Num, Well_Num) %>%
-          # Filter out top image in case of screen aberration
-          mutate(summary_condition = if_else(mean_Nuc_Foci > 1, mean_Nuc_Foci < max(mean_Nuc_Foci), TRUE)) %>%
-          filter(summary_condition) %>%
-         summarise(
-            Nuclei_Number = mean(Nuclei_Number, na.rm = TRUE),
-            Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
-          
-            tdTomato_Area = if (has_td_area) mean(AreaShape_Area, na.rm = TRUE) else NA_real_,
-            tdTomato      = if (has_td_int)  mean(Intensity_IntegratedIntensity_tdTomato, na.rm = TRUE) else NA_real_,
-          
-            AssayType  = unique(SignalStatus),
-            Condition  = unique(Condition),
-            .groups = "drop"
-          )
+#Calculate aggregate statistics for each condition:
+combined_Df <- combined_Df %>%
+  group_by(plate_Num, Well_Num) %>%
+  # Filter out top image in case of screen aberration
+  mutate(
+    n_images = n_distinct(ImageNumber),
+    summary_condition = if_else(n_images >= 8 & mean_Nuc_Foci > 1, mean_Nuc_Foci < max(mean_Nuc_Foci), TRUE)
+  ) %>%
+  filter(summary_condition) %>%
+  summarise(
+    Nuclei_Number = mean(Nuclei_Number, na.rm = TRUE),
+    Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
+    
+    tdTomato_Area = if (has_td_area) mean(AreaShape_Area, na.rm = TRUE) else NA_real_,
+    tdTomato      = if (has_td_int)  mean(Intensity_IntegratedIntensity_tdTomato, na.rm = TRUE) else NA_real_,
+    
+    AssayType  = unique(SignalStatus),
+    Condition  = unique(Condition),
+    .groups = "drop"
+  )
 
 #Determine control statistics:
 pos_Ctrl_DF <- combined_Df %>%
@@ -587,7 +591,7 @@ SB_Plate <- plate_Summary %>% group_by(plate_Num) %>%
 
 
 #EXPORT PLATE SUMMARY:
-plate_Summary$ZPrime_Score <- ZPrime_Score[[1]]
+# plate_Summary$ZPrime_Score <- ZPrime_Score[[1]]
 plate_Summary$SB_Plate <- SB_Plate$SB_Plate
 
 p_ctrls <- combined_Df %>% filter( Condition == pos_Ctrl) %>%
@@ -1132,18 +1136,23 @@ wb <- loadWorkbook(export_File)
 
 if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
+#Order by BZ-Score (descending)
+hits_df <- hits_df %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
+
 writeData(wb, sheet_hits, hits_df, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df))
 
 if (sheet_df %in% names(wb)) removeWorksheet(wb, sheet_df)
 addWorksheet(wb, sheet_df)
+
+#Order by BZ-Score (descending)
+merged_df2 <- merged_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
 writeData(wb, sheet_df, merged_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_df, firstActiveRow = 2)
 addFilter(wb, sheet_df, rows = 1, cols = 1:ncol(merged_df2))
 
 saveWorkbook(wb, export_File, overwrite = TRUE)
- 
 ```
 
 ```{r}
@@ -1341,7 +1350,7 @@ normalized_dist <- normalized_dist +
 # 1. CONFIGURATION
 # ============================================================
 #If not previously defined:
-fileX   <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/CondenScreenV2.xlsx"
+fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
 
 export_File <- fileX
 sheetX  <- "Combined Analysis"
@@ -1787,6 +1796,7 @@ p_heat_hit <- heatmap_metric(
   "Total hits"
 ) +
   hit_impact_purple_deeper(max_hits = max_hits_well) +
+  scale_y_discrete(limits = rev) +
   theme(legend.position = "right")
 
 p_heat_z <- p_heat_z +
@@ -1794,7 +1804,8 @@ p_heat_z <- p_heat_z +
     title = "Heatmap: Median Z-Score by Well Position",
     fill  = "Median Z-Score"
   ) +
-  heatmap_theme_clean
+  heatmap_theme_clean +
+  scale_y_discrete(limits = rev) 
 
 if (has_bz) {
   p_heat_bz <- p_heat_bz +
@@ -1802,9 +1813,9 @@ if (has_bz) {
       title = "Heatmap: Median BZ-Score by Well Position",
       fill  = "Median BZ-Score"
     ) +
-    heatmap_theme_clean
-}
-
+    heatmap_theme_clean +
+  scale_y_discrete(limits = rev) 
+  }
 
 p_heat_hit <- p_heat_hit +
   labs(title = "Heatmap: Total Hits by Well Position") +
@@ -1955,6 +1966,10 @@ wb <- loadWorkbook(fileX)
 if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
 
+
+#Order by BZ-Score (descending)
+hits_df2 <- hits_df2 %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
+
 writeData(wb, sheet_hits, hits_df2, startCol = 1, startRow = 1, colNames = TRUE)
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df2))
@@ -1970,10 +1985,10 @@ saveWorkbook(wb, fileX, overwrite = TRUE)
 # Configuration
 # ============================================================
 #Path to previously exported datasheet.
-#save_Location <- "/Users/dylan/Downloads/pharmakon 2/"
+#save_Location <- "/home/userX/pathsource/"
 
 #If not previously defined:
-fileX   <- "/Users/dylan/Documents/Bioinformatics/condenscreen/Condenscreen-v1.2/DownloadCondenScreen/CondenScreenV2.xlsx"
+fileX   <- "/home/userX/pathsource/CondenScreenV2.xlsx"
 
 #Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
 CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
@@ -2570,7 +2585,10 @@ wb <- loadWorkbook(fileX)
 if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
 addWorksheet(wb, sheet_hits)
 
+#Order by BZ-Score (descending)
+df_final <- df_final %>% arrange(desc(if ("BZScore" %in% names(.)) BZScore else ZScore))
 writeData(wb, sheet_hits, df_final, startCol = 1, startRow = 1, colNames = TRUE)
+
 freezePane(wb, sheet_hits, firstActiveRow = 2)
 addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(df_final))
 
@@ -2584,6 +2602,7 @@ for (sh in setdiff(names(wb), new_order)) {
 
 # Reorder by matching positions
 worksheetOrder(wb) <- match(new_order, names(wb))
+
 
 saveWorkbook(wb, fileX, overwrite = TRUE)
 
