@@ -1,0 +1,2614 @@
+---
+title: "CondenScreen R Script"
+output: html_notebook
+author: Dylan Poch
+---
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+
+```{r}
+#PACKAGES
+#------------------------------------------------------------------------------
+# Packages are automatically installed if missing to ensure reproducibility
+
+required_packages <- c("tidyverse", "knitr", "DBI", "ggpval", "openxlsx",
+                       "EnvStats", "ggpubr", "psych", "plotrix", "BSDA",
+                       "ggrepel", "data.table", "progress", "shiny", "plotly",
+                       "htmltools", "sass", "rlang", "gridExtra", "ggplate",
+                       "writexl", "httr2", "reticulate", "jsonlite", "patchwork")
+
+
+installed <- rownames(installed.packages())
+
+for (pkg in required_packages) {
+  if (!pkg %in% installed) {
+    message("Installing package: ", pkg)
+    install.packages(pkg, dependencies = TRUE)
+  }
+  suppressPackageStartupMessages(
+  library(pkg, character.only = TRUE)
+  )
+}
+```
+
+```{r}
+# CondenScreen GUI 
+#------------------------------------------------------------------------------
+
+# Function to generate well coordinates
+generate_well_coordinates <- function(rows, cols) {
+  expand.grid(Row = LETTERS[1:rows], Col = 1:cols) %>%
+    mutate(
+      Col = as.integer(Col),
+      Well = paste0(Row, sprintf("%02d", Col)),
+      Condition = "None"
+    )
+}
+
+# ---------------------------
+# UI
+# ---------------------------
+ui <- fluidPage(
+  titlePanel("CondenScreen Well Selection:"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput(
+        "plate_type", "Select Plate Type:",
+        choices = c(
+          "6-well"   = "2x3",
+          "12-well"  = "3x4",
+          "24-well"  = "4x6",
+          "96-well"  = "8x12",
+          "384-well" = "16x24"
+        )
+      ),
+
+      radioButtons(
+        "condition", "Select Condition:",
+        choices = c("Positive Control", "Negative Control", "Test Condition", "Unselect")
+      ),
+
+      textInput("pos_control_name", "Positive Control Name:", value = "Positive Ctrl"),
+      textInput("neg_control_name", "Negative Control Name:", value = "Negative Ctrl"),
+
+      # NEW: Chemical vs Genetic screen toggle (button)
+      actionButton("screen_toggle", "Screen: Chemical", style = "width: 100%"),
+
+      # Existing: signal toggle
+      actionButton("signal_toggle", "Signal: OFF", style = "width: 100%"),
+
+      actionButton("clear", "Clear Selections"),
+      hr(),
+
+      strong("Save Directory:"),
+      div(
+        style = "display: flex; margin-bottom: 10px;",
+        textInput("save_dir", NULL, value = paste0(getwd(), "/"), width = "100%")
+      ),
+
+      textInput(
+        "save_filename",
+        "Save File Name: (end with .csv; Final analysis will be in YOURFILENAME_results.csv)",
+        value = "well_selection.csv"
+      ),
+
+      strong("Input Directory:"),
+      div(
+        style = "display: flex; margin-bottom: 10px;",
+        textInput("input_dir", NULL, value = paste0(getwd(), "/"), width = "100%"),
+        actionButton("parent_input_dir", "↑", style = "margin-left: 5px;"),
+        actionButton("reset_input_dir", "Reset", style = "margin-left: 5px;")
+      ),
+
+      hr(),
+      downloadButton("download", "Download Selection"),
+      actionButton("exit_app", "Exit", class = "btn-danger", style = "width: 100%;")
+    ),
+
+    mainPanel(
+      plotlyOutput("plate_plot"),
+      tableOutput("selected_wells")
+    )
+  )
+)
+
+# ---------------------------
+# SERVER
+# ---------------------------
+server <- function(input, output, session) {
+
+  # Reactive values for directories (metadata)
+  save_dir <- reactiveVal(getwd())
+  input_dir <- reactiveVal(file.path(getwd(), "data"))
+
+  observeEvent(input$save_dir, {
+    if (dir.exists(input$save_dir)) save_dir(input$save_dir)
+  })
+
+  observeEvent(input$input_dir, {
+    if (dir.exists(input$input_dir)) input_dir(input$input_dir)
+  })
+
+  observeEvent(input$parent_input_dir, {
+    current <- input_dir()
+    parent <- dirname(current)
+    input_dir(parent)
+    updateTextInput(session, "input_dir", value = parent)
+  })
+
+  observeEvent(input$reset_input_dir, {
+    default <- file.path(getwd(), "data")
+    input_dir(default)
+    updateTextInput(session, "input_dir", value = default)
+  })
+
+  # Plate dimensions
+  plate_dims <- reactive({
+    dims <- strsplit(input$plate_type, "x")[[1]]
+    list(rows = as.integer(dims[1]), cols = as.integer(dims[2]))
+  })
+
+  # Main data store
+  well_data <- reactiveVal(data.frame(Row = character(), Col = integer(), Well = character(), Condition = character()))
+
+  # Initialize / regenerate on plate type changes
+  observeEvent(input$plate_type, {
+    dims <- plate_dims()
+    df <- generate_well_coordinates(dims$rows, dims$cols)
+    well_data(df)
+  }, ignoreInit = TRUE)
+
+  observe({
+    if (nrow(well_data()) == 0) {
+      dims <- plate_dims()
+      df <- generate_well_coordinates(dims$rows, dims$cols)
+      well_data(df)
+    }
+  })
+
+  # Chemical vs Genetic toggle
+  screen_type <- reactiveVal("Chemical")
+  observeEvent(input$screen_toggle, {
+    screen_type(ifelse(screen_type() == "Chemical", "Genetic", "Chemical"))
+    updateActionButton(session, "screen_toggle", label = paste0("Screen: ", screen_type()))
+  })
+
+  # Signal toggle
+  signal_status <- reactiveVal(FALSE)
+  observeEvent(input$signal_toggle, {
+    signal_status(!signal_status())
+    updateActionButton(session, "signal_toggle",
+                       label = ifelse(signal_status(), "Signal: ON", "Signal: OFF"))
+  })
+
+  # Map UI condition to internal label
+  normalize_condition <- function(cond) {
+    if (identical(cond, "Unselect")) return("None")
+    cond
+  }
+
+  # Plot
+  output$plate_plot <- renderPlotly({
+    df <- well_data()
+
+    plot_ly(
+      df,
+      x = ~factor(Col, levels = sort(unique(Col))),
+      y = ~factor(Row, levels = rev(unique(Row))),
+      type = "scatter",
+      mode = "markers",
+      key = ~Well,  # <<< CRITICAL: stable identity so click/select never maps to wrong well
+      marker = list(
+        size = 15,
+        color = ~case_when(
+          Condition == "Positive Control" ~ "green",
+          Condition == "Negative Control" ~ "red",
+          Condition == "Test Condition" ~ "black",
+          TRUE ~ "gray"
+        )
+      ),
+      source = "plateplot"
+    ) %>%
+      layout(
+        xaxis = list(title = "Column"),
+        yaxis = list(title = "Row"),
+        showlegend = FALSE,
+        dragmode = "select"
+      )
+  })
+
+  # Box select: use key (Well) not x/y
+  observeEvent(event_data("plotly_selected", source = "plateplot"), {
+    selected_data <- event_data("plotly_selected", source = "plateplot")
+    if (is.null(selected_data) || is.null(selected_data$key)) return()
+
+    df <- well_data()
+    new_cond <- normalize_condition(input$condition)
+    wells_clicked <- as.character(selected_data$key)
+
+    df$Condition[df$Well %in% wells_clicked] <- new_cond
+    well_data(df)
+  })
+
+  # Click select: use key (Well) not x/y
+  observeEvent(event_data("plotly_click", source = "plateplot"), {
+    click_data <- event_data("plotly_click", source = "plateplot")
+    if (is.null(click_data) || is.null(click_data$key)) return()
+
+    df <- well_data()
+    new_cond <- normalize_condition(input$condition)
+    well_clicked <- as.character(click_data$key)
+
+    df$Condition[df$Well == well_clicked] <- new_cond
+    well_data(df)
+  })
+
+  # Table (with renamed controls)
+  output$selected_wells <- renderTable({
+    well_data() %>%
+      mutate(Condition = case_when(
+        Condition == "Positive Control" ~ input$pos_control_name,
+        Condition == "Negative Control" ~ input$neg_control_name,
+        Condition == "None" ~ NA_character_,
+        TRUE ~ Condition
+      ))
+  })
+
+  # Download: includes plate dims + screen type
+  output$download <- downloadHandler(
+    filename = function() input$save_filename,
+    content = function(file) {
+
+      df <- well_data() %>%
+        mutate(Condition = case_when(
+          Condition == "Positive Control" ~ input$pos_control_name,
+          Condition == "Negative Control" ~ input$neg_control_name,
+          Condition == "None" ~ NA_character_,
+          TRUE ~ Condition
+        ))
+
+      dims <- plate_dims()
+
+      settings_df <- data.frame(
+        PlateType = input$plate_type,         # e.g. "16x24"
+        PlateRows = dims$rows,
+        PlateCols = dims$cols,
+        PlateWells = dims$rows * dims$cols,
+
+        ScreenType = screen_type(),           # "Chemical" / "Genetic"
+        SaveDirectory = save_dir(),           # metadata
+        InputDirectory = input_dir(),         # metadata
+        SignalStatus = ifelse(signal_status(), "ON", "OFF"),
+        PositiveControlName = input$pos_control_name,
+        NegativeControlName = input$neg_control_name,
+        stringsAsFactors = FALSE
+      )
+
+      final_df <- cbind(settings_df, df)
+
+      # (Optional) create SaveDirectory on disk, but the browser download won't use it.
+      target_dir <- save_dir()
+      if (!dir.exists(target_dir)) dir.create(target_dir, recursive = TRUE, showWarnings = FALSE)
+
+      write.csv(final_df, file, row.names = FALSE)
+    }
+  )
+
+  # Clear selections
+  observeEvent(input$clear, {
+    df <- well_data()
+    df$Condition <- "None"
+    well_data(df)
+  })
+
+  # Exit button
+  observeEvent(input$exit_app, {
+    stopApp()
+  })
+
+  session$onSessionEnded(function() stopApp())
+}
+
+# Run app
+shinyApp(ui = ui, server = server)
+```
+
+
+```{r}
+#EDIT: Add path to recently saved .csv file:
+#############################################################  
+#Make sure all pathways use foward slash (/)!
+#save_Location <- "/home/userX/pathsource/"
+save_Location <-"/Users/PathName"
+file_Location<- save_Location
+#############################################################
+
+dfSelection <-  fread(paste0(save_Location, "well_selection.csv"))
+
+#Add trailing slash, if necessary:
+add_trailing_slash <- function(filePath) {
+  # Replace backslashes and double slashes with forward slashes
+  filePath <- gsub("\\\\+", "/", filePath)  # replaces \ and \\ with /
+  filePath <- gsub("/+", "/", filePath)     # collapses multiple / into a single /
+
+  # Ensure exactly one trailing slash
+  filePath <- sub("/?$", "/", filePath)
+
+  return(filePath)
+}
+
+
+image_Save_Location <- add_trailing_slash(dfSelection$SaveDirectory[1])
+file_Location <- add_trailing_slash(dfSelection$InputDirectory[1])
+assayType <- dfSelection$SignalStatus[1]
+pos_Ctrl <- dfSelection$PositiveControlName[1]
+neg_Ctrl <- dfSelection$NegativeControlName[1]
+
+rows <- dfSelection$PlateRows[1]
+cols <- dfSelection$PlateCols[1]
+plateSize <- dfSelection$PlateWells[1]
+ChemVGene <- dfSelection$ScreenType[1]
+
+#Edit: Change string parsing to match the specific naming convention you used while naming the CellProfiler output
+#UNLESS CHANGED FILENAME PATTERNS IN CELLPROFILER, LEAVE AS IS:
+#Change recursive = TRUE to FALSE if you don't wish to search through all sub-directories of your current directory
+#############################################################
+
+#file_paths <- dir(file_Location, pattern = "*.FociQuant.*", full.names = TRUE, recursive = TRUE)
+file_paths <- list.files(file_Location, pattern = "*.FociQuant.*", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)
+
+#############################################################
+
+# Check if the file exists
+path_to_batchScript <- paste0(file_Location, "process_batch.R")
+
+if (file.exists(path_to_batchScript)) {
+  cat("The batch script exists. Success!\n")
+} else {
+  cat("The batch script file does not exist. Try downloading directly into your selected file_Location \n")
+}
+
+# Save file paths to disk so each batch can access them
+saveRDS(file_paths, file.path(file_Location, "file_paths.rds"))
+
+batch_size <- 20
+total_files <- length(file_paths)
+stopifnot(total_files > 0)  # fail early instead of launching nothing
+
+total_batches <- ceiling(total_files / batch_size)
+
+script_path <- file.path(file_Location, "process_batch.R")
+stopifnot(file.exists(script_path))
+
+for (i in 1:total_batches) {
+  start_idx <- (i - 1) * batch_size + 1
+  end_idx   <- min(i * batch_size, total_files)
+
+  cat("Launching batch", i, "of", total_batches, "\n")
+
+res <- system2(
+  command = "Rscript",
+  args = c(
+    shQuote(script_path),
+    start_idx,
+    end_idx,
+    i,
+    shQuote(file.path(file_Location, "file_paths.rds")),
+    shQuote(file_Location)
+  ),
+  stdout = TRUE,
+  stderr = TRUE
+)
+
+cat(paste(res, collapse="\n"))
+
+  gc()
+}
+ 
+# After all batches are done, combine if needed
+cat("All batches completed. Combining results...\n")
+
+# List all batch files
+batch_files <- list.files(file_Location, 
+                         pattern = "^batch_\\d+\\.csv$",
+                         full.names = TRUE)
+# Combine all batches into a final result
+combined_data <- rbindlist(lapply(batch_files, fread))
+fwrite(combined_data, paste0(file_Location, "final_combined_result.csv"))
+
+cat("Processing complete!\n")
+
+
+#Note: Will create tdTomato and Area columns even if empty for consistent DataFrame formatting
+
+combined_data <- rbindlist(lapply(batch_files, fread), fill = TRUE)
+
+# --- Make tdTomato/Area optional but stable (always present, always numeric) ---
+ensure_numeric <- function(DT, col) {
+  if (!col %in% names(DT)) DT[, (col) := NA_real_]
+  DT[, (col) := suppressWarnings(as.numeric(get(col)))]
+  invisible(NULL)
+}
+
+ensure_numeric(combined_data, "Intensity_IntegratedIntensity_tdTomato")
+ensure_numeric(combined_data, "AreaShape_Area")
+
+has_td_int  <- "Intensity_IntegratedIntensity_tdTomato" %in% names(combined_data) &&
+               any(!is.na(combined_data$Intensity_IntegratedIntensity_tdTomato))
+has_td_area <- "AreaShape_Area" %in% names(combined_data) &&
+               any(!is.na(combined_data$AreaShape_Area))
+
+has_td <- has_td_int || has_td_area
+
+```
+
+
+```{r}
+# STRING EXTRACTION FOR WELL/PLATE NAMING CONVENTIONS 
+
+# Vectorized version
+extract_info_vectorized <- function(combinedDF) {
+  
+  # Define patterns
+#================================================================
+  pattern_filename <- "([A-Za-z0-9]+)_([A-Za-z0-9]+)_s(\\d+)_w\\d+"
+  pattern_pathname <- "\\d{8}-([A-Za-z0-9]+)_Plate_\\d+"
+#================================================================
+  # Extract all matches at once using vectorized operations
+  matches <- str_match(combinedDF$FileName_GFP, pattern_filename)
+  
+  # Initialize result tibble with extracted values
+  result <- tibble(
+    plate_Num = matches[, 2],
+    Well_Num = matches[, 3],
+    Image_Num = matches[, 4]
+  )
+  
+  return(result)
+}
+
+
+# Apply the vectorized function directly to the dataframe
+extractedInfo <- extract_info_vectorized(combined_data)
+
+combined_data[, c("plate_Num", "Well_Num", "Imagecopy_Num") := extractedInfo]
+
+combined_Df <- combined_data
+
+
+```
+
+
+```{r}
+# INDIVIDUAL CONDITION/CONTROL STATISTICS 
+#------------------------------------------------------------------------------
+#[OPTIONAL] Filter out bottom 75% (to control for a transfection efficiency of 1:4)
+#Filter conditions that leave < 5 cells/image (too much variance for meaningful interpretation)
+combined_Df <- combined_Df %>%
+  
+  group_by(plate_Num, Well_Num, ImageNumber) %>%
+  
+  arrange(Children_GFP_foci_Count, .by_group = TRUE) %>%
+  
+  #---------------------------------------
+  #COMMENT OUT UNLESS YOU WANT TO TAKE ONLY THE TOP 25% OF CELLS TO ACCOUNT FOR TRANSFECTION EFFICIENCY!!!
+  # mutate(nlen = ceiling(n() * 0.75)) %>%
+  # filter(row_number() > nlen) %>%
+  #--------------------------------------
+
+  filter(n() > 5) %>%
+  ungroup() %>%
+  
+  group_by(plate_Num, Well_Num, Imagecopy_Num) %>%
+  
+  mutate(
+    Nuclei_Number = n(),
+    mean_Nuc_Foci = mean(Children_GFP_foci_Count, na.rm = TRUE)
+  ) %>%
+  
+  ungroup()
+
+#Combine with assigned conditions:
+dfSelection <- dfSelection %>% rename(Well_Num = Well)
+combined_Df <- merge(combined_Df, dfSelection[, c('SignalStatus', 'Condition', 'Well_Num')], by = "Well_Num")
+
+combined_Df <- combined_Df %>% 
+  mutate(Condition = ifelse(Condition == "Test Condition", Well_Num, Condition)) %>%
+  filter(complete.cases(Condition))
+
+#Calculate aggregate statistics for each condition:
+#Calculate aggregate statistics for each condition:
+combined_Df <- combined_Df %>%
+  group_by(plate_Num, Well_Num) %>%
+  # Filter out top image in case of screen aberration
+  mutate(
+    n_images = n_distinct(ImageNumber),
+    summary_condition = if_else(n_images >= 8 & mean_Nuc_Foci > 1, mean_Nuc_Foci < max(mean_Nuc_Foci), TRUE)
+  ) %>%
+  filter(summary_condition) %>%
+  summarise(
+    Nuclei_Number = mean(Nuclei_Number, na.rm = TRUE),
+    Avg_Foci      = mean(mean_Nuc_Foci, na.rm = TRUE),
+    
+    tdTomato_Area = if (has_td_area) mean(AreaShape_Area, na.rm = TRUE) else NA_real_,
+    tdTomato      = if (has_td_int)  mean(Intensity_IntegratedIntensity_tdTomato, na.rm = TRUE) else NA_real_,
+    
+    AssayType  = unique(SignalStatus),
+    Condition  = unique(Condition),
+    .groups = "drop"
+  )
+
+
+#Determine control statistics:
+pos_Ctrl_DF <- combined_Df %>%
+  group_by(plate_Num) %>%
+  filter(Condition == pos_Ctrl) %>%
+  summarize(
+    mean_Pos_SD   = sd(Avg_Foci, na.rm=TRUE),
+    mean_Pos_Foci = mean(Avg_Foci, na.rm=TRUE),
+    cv_Pos        = cv(Avg_Foci) * 100,
+
+    tdTomato_Pos_Area      = if (has_td_area) mean(tdTomato_Area, na.rm=TRUE) else NA_real_,
+    Nuclear_Pos_TdTomato   = if (has_td_int)  mean(tdTomato, na.rm=TRUE)      else NA_real_,
+    .groups = "drop"
+  )
+
+
+neg_Ctrl_DF <- combined_Df %>%
+  group_by(plate_Num) %>%
+  filter(Condition == neg_Ctrl) %>%
+  summarize(
+    mean_Neg_SD   = sd(Avg_Foci, na.rm = TRUE),
+    mean_Neg_Foci = mean(Avg_Foci, na.rm = TRUE),
+    cv_Neg        = cv(Avg_Foci) * 100,
+
+    tdTomato_Neg_Area    = if (has_td_area) mean(tdTomato_Area, na.rm = TRUE) else NA_real_,
+    Nuclear_Neg_TdTomato = if (has_td_int)  mean(tdTomato, na.rm = TRUE)      else NA_real_,
+
+    .groups = "drop"
+  )
+
+plate_Summary <- merge(pos_Ctrl_DF, neg_Ctrl_DF)
+
+plate_Summary <- plate_Summary %>%
+  ungroup() %>%
+  mutate(
+    ZPrime_Score = round(
+      1 - (3 * (.data$mean_Pos_SD + .data$mean_Neg_SD) /
+             abs(.data$mean_Pos_Foci - .data$mean_Neg_Foci)),
+      2
+    )
+  )
+
+SB_Plate <- plate_Summary %>% group_by(plate_Num) %>%
+  mutate(
+    SB_Plate = ifelse(
+      unique(assayType) == "OFF", 
+      mean_Neg_Foci / mean_Pos_Foci, 
+      mean_Pos_Foci / mean_Neg_Foci
+    )
+  )
+
+
+#EXPORT PLATE SUMMARY:
+# plate_Summary$ZPrime_Score <- ZPrime_Score[[1]]
+plate_Summary$SB_Plate <- SB_Plate$SB_Plate
+
+p_ctrls <- combined_Df %>% filter( Condition == pos_Ctrl) %>%
+  group_by(plate_Num) %>%
+     summarise(Control = paste0(pos_Ctrl), across(c( Nuclei_Number, Avg_Foci, tdTomato), mean, na.rm = TRUE), Condition = pos_Ctrl)
+
+
+n_ctrls <- combined_Df %>% filter( Condition == neg_Ctrl) %>% 
+  group_by(plate_Num) %>%
+     summarise(Control = paste0(neg_Ctrl), across(c(Nuclei_Number, Avg_Foci, tdTomato), mean, na.rm = TRUE), Condition = neg_Ctrl)
+
+#Export controls summary:
+ctrls <- rbind(p_ctrls, n_ctrls)
+
+#Combined main dataframe: 
+combined_Df <- merge(combined_Df, plate_Summary[, c("plate_Num", "ZPrime_Score")], by = "plate_Num" )
+
+print(combined_Df)
+ 
+```
+
+
+```{r}
+# NORMALIZED EFFECTS & CYTOTOXICITY AND MORPHOLOGY ANALYSIS
+#------------------------------------------------------------------------------
+
+#Creates a temp dataframe to not write over original
+ temp_stats_Df<- combined_Df %>%
+  # Remove controls
+  filter(Condition == Well_Num) %>%
+  
+  # Group by plate number
+  group_by(plate_Num) %>%
+  
+  # Calculate percent change relative to plate
+  mutate(
+    PercentChange = ifelse(
+      `AssayType` == "OFF",
+      ((mean(Avg_Foci) - Avg_Foci) / mean(Avg_Foci)) * 100,
+      ((Avg_Foci - mean(Avg_Foci)) / mean(Avg_Foci)) * 100
+    ),
+    
+    # Calculate the mean and standard deviation of each plate (based on PercentChange)
+    mean_percentEffect = mean(PercentChange),
+    SD_percentEffect = sd(PercentChange),
+  
+    # Calculate Z-scores for test conditions specific to each plate
+    ZScore = (PercentChange - mean_percentEffect) / SD_percentEffect,
+  
+    # Calculate normalized differences for nuclear area, form factor, and cell count
+    #NuclearAreaDiff = (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100,
+    tdTomato_Diff = (tdTomato - mean(tdTomato)) / mean(tdTomato) * 100,
+    CellCountDiff = (Nuclei_Number - mean(Nuclei_Number)) / mean(Nuclei_Number) * 100
+  )
+
+#Remove any duplicated columns up till now 
+
+#OPTIONAL -- Can have a more detailed view on cytotoxicity based on cell count and nuclear health:
+#Ceullular Health Function (as function of cell density, nuclear area, and nuclear formfactor/morphological differences)
+# temp_stats_Df$Viability <- temp_stats_Df %>% group_by(plate_Num, Well_Num) %>%
+#   
+#   # summarize(Viability =
+#   #   CellCountDiff + ((100 + CellCountDiff) / 100) * mean(NuclearAreaDiff, tdTomato_Diff)) %>% 
+#   #    pull(Viability)
+#   summarize(Viability =
+#     CellCountDiff)
+
+temp_stats_Df <- temp_stats_Df %>%
+  ungroup() %>%
+  mutate(Viability = CellCountDiff)
+
+
+```
+
+
+
+```{r}
+# B-SCORE CALCULATION (CONTROLS FOR POSITIONAL EFFECTS) 
+#------------------------------------------------------------------------------
+
+BScore_func <- function(df, rows, cols,
+                        effect_col = "PercentChange",
+                        well_col   = "Well_Num") {
+
+  temp_df <- df
+
+  # Full plate indexing
+  row_levels <- LETTERS[1:rows]
+  col_levels <- 1:cols
+
+  # Parse wells like A01, B12, etc.
+  well <- as.character(temp_df[[well_col]])
+  r <- substr(well, 1, 1)
+  cnum <- suppressWarnings(as.integer(sub("^[A-Za-z]+", "", well)))
+
+  keep <- !is.na(r) & !is.na(cnum) & r %in% row_levels & cnum %in% col_levels
+  if (!any(keep)) {
+    return(dplyr::tibble(Well_Num = character(0), BScore = numeric(0), BZ_Score = numeric(0)))
+  }
+
+  # Build full plate matrix
+  mtx <- matrix(NA_real_, nrow = rows, ncol = cols,
+                dimnames = list(row_levels, as.character(col_levels)))
+
+  eff <- suppressWarnings(as.numeric(temp_df[[effect_col]]))
+
+  # Fill matrix (vectorized)
+  mtx[cbind(match(r[keep], row_levels), match(cnum[keep], col_levels))] <- eff[keep]
+
+  # Median polish + MAD scaling (B-score)
+  bmat <- tryCatch({
+    mp <- stats::medpolish(mtx, trace.iter = FALSE)
+    resid <- mp$residuals
+    MAD <- stats::mad(resid, constant = 1, na.rm = TRUE)
+    if (is.na(MAD) || MAD == 0) MAD <- 1
+    resid / MAD
+  }, error = function(e) {
+    # Fallback: impute missing with plate median and retry
+    fill <- stats::median(mtx, na.rm = TRUE)
+    if (is.na(fill)) fill <- 0
+    mtx[is.na(mtx)] <- fill
+
+    mp <- stats::medpolish(mtx, trace.iter = FALSE)
+    resid <- mp$residuals
+    MAD <- stats::mad(resid, constant = 1, na.rm = TRUE)
+    if (is.na(MAD) || MAD == 0) MAD <- 1
+    resid / MAD
+  })
+
+  # Convert to tibble for wells present in this df
+  out <- expand.grid(
+    Row = row_levels,
+    Col = col_levels,
+    stringsAsFactors = FALSE
+  )
+  out$Well_Num <- paste0(out$Row, sprintf("%02d", out$Col))
+  out$BScore   <- as.vector(bmat)
+
+  out <- dplyr::as_tibble(out) %>%
+    dplyr::filter(.data$Well_Num %in% unique(well[keep])) %>%
+    dplyr::select(.data$Well_Num, .data$BScore)
+
+  # BZ-score (within-plate normalization of B-score)
+  mu <- mean(out$BScore, na.rm = TRUE)
+  sdv <- stats::sd(out$BScore, na.rm = TRUE)
+  if (is.na(sdv) || sdv == 0) sdv <- 1
+
+  out <- out %>%
+    dplyr::mutate(BZ_Score = (.data$BScore - mu) / sdv)
+
+  out
+}
+
+# ---- RUN B-SCORE ONLY WHEN:
+# (1) assayType == "OFF" AND (2) plateSize >= 96
+# Should not use BZ-Score if plate size is smaller than 96 wells
+if (assayType == "OFF" && plateSize >= 96) {
+
+bs_res <- temp_stats_Df %>%
+  filter(Condition == Well_Num) %>%
+  group_by(plate_Num) %>%
+  nest() %>%
+  mutate(bscores = map(data, ~{
+    out <- BScore_func(.x, rows = rows, cols = cols)
+    out$plate_Num <- unique(.x$plate_Num)
+    out
+  })) %>%
+  select(-data) %>%     # ← DROP IT HERE
+  unnest(bscores)
+
+  
+  # Join back safely by plate + well (no row-order assumptions)
+ temp_stats_Df <- temp_stats_Df %>%
+  left_join(bs_res, by = c("plate_Num", "Well_Num")) %>%
+  rename(BZScore = BZ_Score)
+
+} else {
+  # Explicitly create columns so downstream code doesn't break
+  temp_stats_Df$BScore  <- NA_real_
+  temp_stats_Df$BZScore <- NA_real_
+
+  if (assayType == "OFF" && plateSize < 96) {
+    message("Skipping B-score: plate size < 96 wells (medpolish is unstable with too few wells).")
+  }
+}
+ 
+ 
+
+ 
+```
+
+
+
+
+```{r}
+# EXPORT PLATE FIGURES (OPTIONAL, CAN COMMENT OUT) 
+#------------------------------------------------------------------------------
+
+# Define path
+sub_dir <- paste0(file_Location,"Plate_Figures/") 
+
+# Create subdirectory
+if (!dir.exists(sub_dir)) {
+  dir.create(sub_dir, recursive = TRUE)
+  print("Subdirectory created successfully!")
+} else {
+  print("Subdirectory already exists.")
+}
+
+
+for (plate in seq_len(length(unique(combined_Df$plate_Num)))){
+  plate_List <- unique(combined_Df$plate_Num)
+  sub_df <- subset(combined_Df, plate_Num == plate_List[plate])
+
+   nuc_plate <- plate_plot(
+    data = sub_df,
+    position = Well_Num,
+    value = Avg_Foci,
+    plate_size = plateSize,
+    label = round(Avg_Foci, 0),
+    title = paste(plate_List[plate], ", Avg. Foci/Condition:", sep = ""),
+    title_size = 14,
+    label_size = 1.6,
+    colour = c("#FF0000", "#006600", "#006600", "#00CC00", "#00FF00")
+   
+  )
+
+    
+    cell_plate <- plate_plot(
+    data = sub_df,
+    position = Well_Num,
+    value = Nuclei_Number,
+    plate_size = plateSize,
+    # label = round(Nuclei_Number),
+    title = paste(plate_List[plate], ", Avg. Cell Count/Condition:", sep = ""),
+    title_size = 14,
+    label_size = 1.6,
+    colour = c("#FF0000", "#006600", "#006600", "#00CC00", "#00FF00")
+  )
+    
+  plots <- list(nuc_plate, cell_plate)
+
+if (has_td_int && "tdTomato" %in% names(sub_df) && any(!is.na(sub_df$tdTomato))) {
+  tdTomato_plate <- plate_plot(
+    data = sub_df,
+    position = Well_Num,
+    value = tdTomato,
+    plate_size = plateSize,
+    title = paste(plate_List[plate], ", Avg. TdTomato Intensity/Condition:", sep = ""),
+    title_size = 14,
+    label_size = 1.6,
+    colour = c("#FF0000", "#006600", "#006600", "#00CC00", "#00FF00")
+  )
+  plots <- c(plots, list(tdTomato_plate))
+}
+
+combined_plot <- do.call(grid.arrange, c(plots, ncol = 1))
+    
+
+  ggsave(filename = paste0(sub_dir, paste(plate_List[plate], "WTScreen_Figure.png")), plot = combined_plot, width = 8, height = 8)
+
+}
+
+```
+
+```{r}
+#For testing create backup
+combined_Df_backup <- combined_Df
+plate_Summary2_backup <- plate_Summary
+# ORGANIZE AND EXPORT RANKED DATA
+#------------------------------------------------------------------------------
+drop_all_na_cols <- function(df, cols) {
+  cols_present <- intersect(cols, names(df))
+  cols_drop <- cols_present[vapply(df[cols_present], function(x) all(is.na(x)), logical(1))]
+  dplyr::select(df, -dplyr::any_of(cols_drop))
+}
+
+# ---- CONTROLS (optional tdTomato) ----
+ctrl_cols <- c("Nuclei_Number", "Avg_Foci")
+if (has_td_area) ctrl_cols <- c(ctrl_cols, "tdTomato_Area")
+if (has_td_int)  ctrl_cols <- c(ctrl_cols, "tdTomato")
+
+p_ctrls <- combined_Df %>%
+  filter(Condition == pos_Ctrl) %>%
+  group_by(plate_Num) %>%
+  summarise(
+    Control = pos_Ctrl,
+    across(any_of(ctrl_cols), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+n_ctrls <- combined_Df %>%
+  filter(Condition == neg_Ctrl) %>%
+  group_by(plate_Num) %>%
+  summarise(
+    Control = neg_Ctrl,
+    across(any_of(ctrl_cols), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+ctrls <- bind_rows(p_ctrls, n_ctrls) %>%
+  distinct() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  rename(
+    Plate     = plate_Num,
+    CellCount = Nuclei_Number,
+    AvgFoci   = Avg_Foci
+  )
+
+if ("tdTomato_Area" %in% names(ctrls)) ctrls <- ctrls %>% rename(TdTomato_Area = tdTomato_Area)
+if ("tdTomato"      %in% names(ctrls)) ctrls <- ctrls %>% rename(TdTomatoIntensity = tdTomato)
+
+# ---- PLATE SUMMARY: round + rename (robust) + optional drops ----
+plate_Summary <- plate_Summary %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  rename(
+    Plate                 = any_of("plate_Num"),
+    STDPosCtrl            = any_of("mean_Pos_SD"),
+    AvgFociPosCtrl        = any_of("mean_Pos_Foci"),
+    CVPosCtrl             = any_of("cv_Pos"),
+    Pos_TdTomatoArea      = any_of("tdTomato_Pos_Area"),
+    Pos_TdTomatoIntensity = any_of("Nuclear_Pos_TdTomato"),
+    STDNegCtrl            = any_of("mean_Neg_SD"),
+    AvgFociNegCtrl        = any_of("mean_Neg_Foci"),
+    CVNegCtrl             = any_of("cv_Neg"),
+    Neg_TdTomatoArea      = any_of("tdTomato_Neg_Area"),
+    Neg_TdTomatoIntensity = any_of("Nuclear_Neg_TdTomato"),
+    PlateZScore           = any_of("ZPrime_Score"),
+    SB                    = any_of("SB_Plate")
+  )
+
+# Your prior behavior: always remove area cols
+plate_Summary <- plate_Summary %>% select(-any_of(c("Pos_TdTomatoArea", "Neg_TdTomatoArea")))
+
+# If intensity wasn't present, remove those too
+if (!has_td_int) {
+  plate_Summary <- plate_Summary %>% select(-any_of(c("Pos_TdTomatoIntensity", "Neg_TdTomatoIntensity")))
+}
+
+# ---- FINAL RANKED OUTPUT (optional tdTomato) ----
+combined_Df_out <- temp_stats_Df %>% filter(Condition == Well_Num)
+
+base_off <- c("BZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
+              "PercentChange", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
+              "ZScore", "BScore", "AssayType")
+
+base_on  <- c("ZScore", "Viability", "plate_Num", "Well_Num", "ZPrime_Score",
+              "PercentChange", "Avg_Foci", "CellCountDiff", "Nuclei_Number",
+              "AssayType")
+
+td_cols <- character(0)
+if (has_td_area) td_cols <- c(td_cols, "tdTomato_Area")
+if (has_td_int)  td_cols <- c(td_cols, "tdTomato", "tdTomato_Diff")
+
+if (assayType == "OFF") {
+  keep_cols <- intersect(c(base_off, td_cols), names(combined_Df_out))
+
+  combined_Df_out <- combined_Df_out %>%
+    select(all_of(keep_cols)) %>%
+    rename(
+      Plate                = any_of("plate_Num"),
+      Well                 = any_of("Well_Num"),
+      PlateZPrimeScore     = any_of("ZPrime_Score"),
+      PercentEffect        = any_of("PercentChange"),
+      AvgFoci              = any_of("Avg_Foci"),
+      CellCountPercentDiff = any_of("CellCountDiff"),
+      CellCount            = any_of("Nuclei_Number")
+    ) %>%
+    arrange(desc(BZScore)) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+} else {
+  keep_cols <- intersect(c(base_on, td_cols), names(combined_Df_out))
+
+  combined_Df_out <- combined_Df_out %>%
+    select(all_of(keep_cols)) %>%
+    rename(
+      Plate                = any_of("plate_Num"),
+      Well                 = any_of("Well_Num"),
+      PlateZPrimeScore     = any_of("ZPrime_Score"),
+      PercentEffect        = any_of("PercentChange"),
+      AvgFoci              = any_of("Avg_Foci"),
+      CellCountPercentDiff = any_of("CellCountDiff"),
+      CellCount            = any_of("Nuclei_Number")
+    ) %>%
+    arrange(desc(ZScore)) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 2)))
+}
+
+
+
+#Reorder:
+if (assayType == "OFF") {
+combined_Df_out <- combined_Df_out %>% arrange(desc(BZScore))
+ } else {
+combined_Df_out <- combined_Df_out %>% arrange(desc(ZScore))
+ }  
+
+if (assayType == "OFF"){
+  hits_df <- combined_Df_out %>% filter(BZScore >= 2)
+} else {
+  hits_df <- combined_Df_out %>% filter(ZScore >= 2)
+}
+
+    
+
+# ---- DROP tdTomato columns if they are entirely NA ----
+td_cols_all <- c(
+  "tdTomato_Area", "tdTomato", "tdTomato_Diff",
+  "TdTomato_Area", "TdTomatoIntensity",
+  "Pos_TdTomatoArea", "Neg_TdTomatoArea",
+  "Pos_TdTomatoIntensity", "Neg_TdTomatoIntensity"
+)
+
+combined_Df_out <- drop_all_na_cols(combined_Df_out, td_cols_all)
+ctrls           <- drop_all_na_cols(ctrls, td_cols_all)
+plate_Summary   <- drop_all_na_cols(plate_Summary, td_cols_all)
+
+# ---- EXPORT ----
+export_File <- file.path(file_Location, "CondenScreenV2.xlsx")
+wb <- createWorkbook()
+addWorksheet(wb, "Combined Analysis")
+addWorksheet(wb, "Hits")
+addWorksheet(wb, "Plate Statistics")
+addWorksheet(wb, "Controls")
+
+# IMPORTANT FIX: write combined_Df_out (not combined_Df)
+writeData(wb, "Combined Analysis", combined_Df_out, startCol = 1, startRow = 1, colNames = TRUE)
+
+writeData(wb, sheet = "Hits", x = hits_df, startCol = 1,  startRow = 1, colNames = TRUE)
+
+writeData(wb, "Plate Statistics", plate_Summary, startCol = 1, startRow = 1, colNames = TRUE)
+writeData(wb, "Controls", ctrls, startCol = 1, startRow = 1, colNames = TRUE)
+ 
+freezePane(wb, sheet = "Combined Analysis", firstActiveRow = 2)
+freezePane(wb, sheet = "Hits", firstActiveRow = 2)
+freezePane(wb, "Plate Statistics", firstActiveRow = 2)
+freezePane(wb, "Controls", firstActiveRow = 2)
+
+saveWorkbook(wb, file = export_File, overwrite = TRUE)
+```
+
+
+```{r}
+# ------------- SETUP AND CONFIGURATION -------------
+# Disable scientific notation for better readability
+options(scipen = 999)
+
+# ============================================================================
+# CONDENSCREEN FIGURE GENERATION 
+# ============================================================================
+
+# ------------- DATA LOADING AND PREPARATION -------------
+# Load workbook from predefined location (assuming save_Location is defined elsewhere)
+
+wb <- loadWorkbook(export_File)
+
+merged_df <- read.xlsx(wb, sheet = "Combined Analysis")
+
+#Typically comment the following two lines out. Dataset Specific
+#merged_df <- merged_df[merged_df$Plate != "A19946", ]
+merged_df$Plate[merged_df$Plate == "READ"] <- "A19840"
+
+
+# Convert numeric columns to proper type
+merged_df$Average_foci_perCell <- as.numeric(merged_df$AvgFoci)
+merged_df$Normalized_Effect <- as.numeric(merged_df$PercentEffect)
+merged_df <- merged_df[!as.character(merged_df$Plate) %in% c("45", "46", "47"), ]
+#EDIT: Change to location of a file linking compound/gene names to each well, if applicable, else comment out, and run the following 
+#############################################################
+
+template_location <- file.path(file_Location, "plateMap.xlsx")
+template <- read.xlsx(template_location)
+
+well_candidates <- c("Well", "Well_Condition")
+ref_candidates  <- c("Reference", "Gene", "Compound")
+cas_candidates  <- c("CAS", "CAS.Number")
+smiles_candidates <- c("SMILES")
+
+pick_first_existing <- function(df, candidates) {
+  intersect(candidates, colnames(df))[1]
+}
+
+well_col   <- pick_first_existing(template, well_candidates)
+ref_col    <- pick_first_existing(template, ref_candidates)
+cas_col    <- pick_first_existing(template, cas_candidates)
+smiles_col <- pick_first_existing(template, smiles_candidates)
+
+select_cols <- c(
+  intersect("Plate", colnames(template)),
+  well_col,
+  ref_col,
+  cas_col,
+  smiles_col
+)
+
+select_cols <- select_cols[!is.na(select_cols)]
+
+template <- template %>%
+  select(all_of(select_cols)) %>%
+  rename(
+    Well      = any_of(well_candidates),
+    Reference = any_of(ref_candidates),
+    CAS       = any_of(cas_candidates)
+  )
+# Merge data with compound names
+ merged_df <- merge(merged_df, template, by = c("Plate", "Well"))
+
+#############################################################
+#If you do not have access to a file linking reference names to each well, uncomment and run below:
+
+#merged_df$Reference <- merged_df$Well
+
+#############################################################
+
+#-------------------------CHANGE IF NECESSARY----------------------------
+hits_of_interest <- c("PYRITHIONE ZINC", "CELASTROL", "PLUMBAGIN", "DISULFIRAM", "APOL3", "ZNF335", "RNF26", "RAN", "NUP
+                       50", "EIF4A3", "TOR1A", "TOR1B")
+microcephaly  <- c("ZNF335", "SIN3A", "SPDL1", "CDK5", "NCAPD3", "CIT", "SHH")
+#------------------------------------------------------------------------
+
+#############################################################
+
+sheet_hits = "Hits"
+sheet_df = "Combined Analysis"
+merged_df <- merged_df[!is.na(merged_df$Reference), ]  # Keep only rows with reference names (compounds, genes, etc.)
+
+# 1) Build hits_df2 (hits + QC columns)
+#Changed BZ-Cutoff for demo mode due to limited image set
+hits_df <- if (assayType == "OFF") {
+  merged_df %>% filter(BZScore >= 2)
+} else {
+  merged_df %>% filter(ZScore >= 2)
+}
+
+# (optional) make factors safe for Excel
+hits_df <- hits_df %>% mutate(across(where(is.factor), as.character))
+merged_df2 <- merged_df %>% mutate(across(where(is.factor), as.character))
+
+# 2) Load the existing workbook and overwrite both sheets
+wb <- loadWorkbook(export_File)
+
+if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
+addWorksheet(wb, sheet_hits)
+#Order by BZ-Score (descending)
+hits_df <- hits_df %>% arrange(desc(BZScore))
+writeData(wb, sheet_hits, hits_df, startCol = 1, startRow = 1, colNames = TRUE)
+freezePane(wb, sheet_hits, firstActiveRow = 2)
+addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df))
+
+if (sheet_df %in% names(wb)) removeWorksheet(wb, sheet_df)
+addWorksheet(wb, sheet_df)
+merged_df2 <- merged_df2 %>% arrange(desc(BZScore))
+writeData(wb, sheet_df, merged_df2, startCol = 1, startRow = 1, colNames = TRUE)
+freezePane(wb, sheet_df, firstActiveRow = 2)
+addFilter(wb, sheet_df, rows = 1, cols = 1:ncol(merged_df2))
+
+saveWorkbook(wb, export_File, overwrite = TRUE)
+ 
+```
+
+```{r}
+#NORMALIZED SCORE PLOT:
+#NOTE: For demo mode the hit threshold has been changed from 3 to 2. 
+#Also, the Z'-Score is lower.
+#This is due to a much more limited set of images being analyzed, thus requiring more lenient cutoff values.
+#------------------------------------------------------------------------------
+score_col <- if ("BZScore" %in% names(merged_df)) "BZScore" else "ZScore"
+
+merged_df <- merged_df %>%
+  mutate(
+    score_value = .data[[score_col]],
+
+    bz_hit  = score_value >= 2,
+
+    td_ok   = if (has_td_int && "tdTomato_Diff" %in% names(.))
+                tdTomato_Diff >= -25
+              else TRUE,
+
+    viab_ok = if ("Viability" %in% names(.))
+                Viability >= -25
+              else TRUE
+  ) %>%
+  select(-score_value)
+
+plot_normalized_score <- function(df, assay_type, image_path) {
+
+  score_col <- if (assay_type == "OFF") sym("BZScore") else sym("ZScore")
+  label_y   <- if (assay_type == "OFF") "BZ-Score" else "Z-Score"
+
+  y_limits <- c(-4, 8)
+  y_breaks <- c(-4, -2, 0, 2, 4, 6, 8)
+
+  p <- ggplot(df, aes(x = paste0(Well, Plate), y = !!score_col)) +
+
+    # ---- background points (BZ < 3)
+    geom_point(
+      data = dplyr::filter(df, !!score_col < 2),
+      color = "black",
+      size = 1,
+      alpha = 0.4,
+      position = position_jitter(width = 0.3, height = 0)
+    ) +
+
+    # ---- BZ >= 3 hits, colored by phenotype logic
+geom_point(
+  data = dplyr::filter(df, !!score_col >= 2),
+  aes(
+    color = Reference %in% hits_of_interest,
+    size  = Reference %in% hits_of_interest
+  ),
+  alpha = 1
+) +
+scale_size_manual(values  = c("TRUE" = 2.6, "FALSE" = 2)) +
+guides(color = "none", size = "none") +
+  scale_color_manual(
+  values = c(
+    "TRUE"  = "red",
+    "FALSE" = "black"
+    )
+  ) +
+
+  #Optional: Change color based on effect
+    # scale_color_manual(
+    #   values = c(
+    #     green      = "green",
+    #     red        = "red",
+    #     purple     = "purple",
+    #     background = "black"
+    #   )
+    # ) +
+
+    geom_hline(yintercept = 2, linetype = "dashed", size = 1.5) +
+
+    theme_classic() +
+    theme(
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.y  = element_text(size = 18, face = "bold"),
+      axis.title.y = element_text(size = 24, face = "bold"),
+      axis.title.x = element_text(size = 24, face = "bold")
+
+    ) +
+
+    labs(
+  x = "Compound",
+  y = label_y
+    )+
+    scale_y_continuous(limits = y_limits, breaks = y_breaks) +
+    guides(color = "none") +
+    coord_cartesian(ylim = y_limits) +
+    geom_text_repel(
+  data = dplyr::filter(df, !!score_col >= 2),
+  aes(label = Reference),
+  size = 4.5,
+  fontface = "bold",
+  box.padding = 0.4,
+  point.padding = 0.3,
+  max.overlaps = Inf
+)
+
+  ggsave(
+    filename = paste0(image_path, "normalized_SigScoreTdTomatoScreen.pdf"),
+    plot = p,
+    dpi = 300,
+    width = 10,
+    height = 10
+  )
+
+  return(p)
+}
+
+
+plot_normalized_score(merged_df, assayType ,image_Save_Location)
+
+```
+
+```{r}
+#DISTRIBUTION PLOTS
+#------------------------------------------------------------------------------
+
+#RAW DISTRIBUTION
+# Create histogram of raw foci per cell
+  raw_distribution <- ggplot(merged_df, aes(x = AvgFoci)) +
+    geom_histogram(color = "black", fill = "darkgray", binwidth = 1) +
+    geom_density(alpha = 0.6, fill = "darkgray") +
+    labs(title = NULL, y = "Count", x = "MLF2-GFP Foci/Cell") +
+    theme_classic() +
+    theme(title = element_text(size = 40, face = "bold"),
+          axis.title.x = element_text(size = 36, face = "bold"),
+          axis.text.y = element_text(size = 30, face = "bold"),
+          axis.text.x = element_text(size = 30, face = "bold"),
+          axis.ticks.length = unit(0.4, "cm"),
+          axis.ticks = element_line(size = 1.2))
+  
+
+ggsave(paste(image_Save_Location, "images/TdTomatoScreenrawdistrpilot.pdf", sep = ""), 
+        raw_distribution, 
+        dpi = 300, 
+        width = 10, 
+        height = 10)
+  
+
+#NORMALIZED EFFECT DISTRIBUTION
+  normalized_dist <- ggplot(merged_df, aes(x = PercentEffect)) +
+    geom_histogram(color = "black", fill = "darkgray", binwidth = 4 ) +
+    geom_density(alpha = 0.6, fill = "darkgray") +
+    # Add reference lines and labels
+    geom_vline(aes(xintercept = 100), linetype = 'dashed', size = 2.5) +
+    geom_vline(aes(xintercept = 0), linetype = 'dashed', size = 2.5) +
+    theme_classic() +
+    theme(title = element_text(size = 40, face = "bold"),
+          axis.title.x = element_text(size = 36, face = "bold"),
+          axis.text.y = element_text(size = 30, face = "bold"),
+          axis.text.x = element_text(size = 30, face = "bold"),
+          axis.ticks.length = unit(0.4, "cm"),
+          axis.ticks = element_line(size = 1.2))
+  
+  
+#Normalized Distribution Plot:
+if (assayType == "OFF") {
+normalized_dist <- normalized_dist +
+  annotate("text", x = 90, y = 18, label = pos_Ctrl, angle = 90, size = 16) +
+  annotate("text", x = -10, y = 18, label = neg_Ctrl, color = "black", angle = 90, size = 16) +
+  labs(title = NULL, y = "Count", x = "% Decrease in Foci")
+ } else {
+normalized_dist <- normalized_dist +
+  annotate("text", x = 90, y = 1300, label = pos_Ctrl, angle = 90, size = 14) +
+  annotate("text", x = -20, y = 1300, label = neg_Ctrl, color = "black", angle = 90, size = 14) +
+  labs(title = NULL, y = "Count", x = "% Increase in Foci")
+ } 
+     
+  # Save distribution plots
+  ggsave(paste(image_Save_Location, "images/TdTomatoScreendistrpilot.pdf", sep = ""), 
+        normalized_dist, 
+        dpi = 300, 
+        width = 10, 
+        height = 10)
+  
+
+  
+```
+
+
+
+
+
+```{r}
+###OPTIONAL###
+
+# ============================================================
+# HTS Spatial QC - Global Row/Col MEDIAN shifts + Heatmaps
+# Refactored for improved readability and logical flow
+# ============================================================
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+#If not previously defined:
+fileX   <- "/Users/PathName/CondenScreenV2.xlsx"
+
+export_File <- fileX
+sheetX  <- "Combined Analysis"
+out_dir <- paste0(file_Location, "HTS_QC_OUT/")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+hit_threshold <- 2
+alpha_qc <- 0.05
+
+# ============================================================
+# 2. HELPER FUNCTIONS
+# ============================================================
+
+# --- Plotting utilities ---
+save_plot <- function(p, fname, w=12, h=6) {
+  ggsave(file.path(out_dir, fname), plot = p, width=w, height=h, dpi=300)
+}
+
+theme_prismish <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title  = element_text(face = "bold", size = 16),
+
+      axis.title.x = element_text(face = "bold", size = 16),
+      axis.title.y = element_text(face = "bold", size = 16),
+
+      axis.text.x  = element_text(face = "bold", size = 14),
+      axis.text.y  = element_text(face = "bold", size = 14),
+
+      panel.grid = element_blank()
+    )
+}
+
+
+bar_shift <- function(df_sum, xcol, ycol, title, xlab, ylab,
+                      rotate_x = FALSE, ylim = NULL) {
+
+  p <- ggplot(df_sum, aes(x = .data[[xcol]], y = .data[[ycol]])) +
+    geom_col(fill = "#2E1A47", color = "black", linewidth = 0.25, width = 0.9) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+    labs(title = title, x = xlab, y = ylab) +
+    theme_prismish()
+
+  if (!is.null(ylim)) p <- p + coord_cartesian(ylim = ylim)
+  if (rotate_x) p <- p + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+  p
+}
+
+
+heatmap_metric <- function(df_grid, fill_col, title, fill_lab) {
+  ggplot(df_grid, aes(x = factor(col2), y = row, fill = .data[[fill_col]])) +
+    geom_tile(color = NA) +
+    labs(title = title, x = "Column", y = "Row", fill = fill_lab) +
+    theme_prismish() +
+    theme(axis.text.x = element_text(angle=90, vjust=0.5),
+          legend.position = "right") +
+    scale_fill_viridis_c(option = "viridis", na.value = "grey90") +
+    guides(fill = guide_colorbar(title.position = "top", barwidth = unit(0.5, "cm"), barheight = unit(6, "cm")))
+}
+
+save_bar_fig_constant_barwidth <- function(p, fname, n_bars,
+                                           inches_per_bar = 0.55,
+                                           base_inches = 4,
+                                           h = 9,
+                                           min_w = 10,
+                                           max_w = 20) {
+  w <- base_inches + inches_per_bar * n_bars
+  w <- max(min_w, min(max_w, w))
+  ggsave(file.path(out_dir, fname), plot = p, width = w, height = h, dpi = 300)
+}
+
+
+# --- Data parsing ---
+parse_well <- function(df) {
+  df %>% mutate(
+    row = str_sub(Well, 1, 1),
+    col = as.integer(str_remove(Well, "^[A-Za-z]")),
+    col2 = sprintf("%02d", col),
+    well_pos = paste0(row, col2)
+  )
+}
+
+# --- Statistical testing functions ---
+mw_test <- function(df, group_var, value_col) {
+  group_levels <- levels(df[[group_var]])
+  
+  bind_rows(lapply(group_levels, function(g) {
+    in_group <- df[[group_var]] == g
+    x1 <- df[[value_col]][in_group]
+    x2 <- df[[value_col]][!in_group]
+
+    if (length(na.omit(x1)) < 3 || length(na.omit(x2)) < 3) {
+      result <- setNames(list(g, NA_real_, NA_real_), c(group_var, "statistic", "p_value"))
+    } else {
+      wt <- wilcox.test(x1, x2, alternative = "two.sided", exact = FALSE)
+      result <- setNames(list(g, as.numeric(wt$statistic), as.numeric(wt$p.value)), 
+                        c(group_var, "statistic", "p_value"))
+    }
+    
+    result <- as_tibble(result)
+    
+    if (group_var == "well_pos") {
+      result <- result %>% mutate(
+        n_in = sum(in_group),
+        n_out = sum(!in_group),
+        med_in = median(x1, na.rm = TRUE),
+        med_out = median(x2, na.rm = TRUE)
+      )
+    }
+    result
+  })) %>%
+    mutate(p_fdr = p.adjust(p_value, method = "BH")) %>%
+    arrange(p_value)
+}
+
+fisher_test <- function(df, group_var, hit_col = "Hit") {
+  group_levels <- if (is.factor(df[[group_var]])) {
+    levels(df[[group_var]])
+  } else {
+    sort(unique(df[[group_var]]))
+  }
+  
+  bind_rows(lapply(group_levels, function(g) {
+    in_group <- df[[group_var]] == g
+    
+    tab <- matrix(c(
+      sum(df[[hit_col]][in_group] == 1, na.rm=TRUE),
+      sum(df[[hit_col]][in_group] == 0, na.rm=TRUE),
+      sum(df[[hit_col]][!in_group] == 1, na.rm=TRUE),
+      sum(df[[hit_col]][!in_group] == 0, na.rm=TRUE)
+    ), nrow = 2, byrow = TRUE)
+
+    ft <- fisher.test(tab, alternative = "greater")
+    
+    result <- setNames(list(g, as.numeric(ft$p.value)), c(group_var, "p_value"))
+    result <- as_tibble(result)
+    
+    if (group_var == "well_pos") {
+      result <- result %>% mutate(
+        n_in = sum(in_group),
+        hit_in = tab[1,1],
+        hit_out = tab[2,1]
+      )
+    } else if (group_var == "Plate") {
+      result <- result %>% mutate(
+        n_plate = sum(in_group),
+        hits_plate = tab[1,1],
+        hits_other = tab[2,1]
+      )
+    }
+    result
+  })) %>%
+    mutate(p_fdr = p.adjust(p_value, method = "BH")) %>%
+    arrange(p_value)
+}
+
+plot_plate_hits <- function(df, hit_col = "Hit", sig_plates = character(0), 
+                            title = "Hits: global plate totals") {
+  plate_sum <- df %>%
+    group_by(Plate) %>%
+    summarize(hit_sum = sum(.data[[hit_col]] == 1, na.rm = TRUE), .groups = "drop") %>%
+    mutate(sig = Plate %in% sig_plates)
+
+  ggplot(plate_sum, aes(x = factor(Plate), y = hit_sum)) +
+    geom_col(fill = "#2E1A47", color = "black", linewidth = 0.25, width = 0.9) +
+    geom_text(aes(label = hit_sum), vjust = -0.35, size = 3) +
+    geom_text(data = subset(plate_sum, sig), aes(label="*"), vjust = -1.2, size = 6) +
+    labs(title = title, x = "Plate", y = "Total hits") +
+    theme_prismish() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+}
+
+# ============================================================
+# 3. DATA LOADING & PREPARATION
+# ============================================================
+df <- read.xlsx(fileX, sheet = sheetX) %>%
+  parse_well()
+
+# make BZScore optional: if missing, create as NA_real_
+# Ensure BZScore exists (optional column)
+if (!("BZScore" %in% colnames(df))) {
+  df$BZScore <- NA_real_
+}
+
+has_bz <- any(!is.na(df$BZScore))
+
+df <- df %>%
+  mutate(
+    Hit = if ("Hit" %in% colnames(.)) {
+      as.integer(Hit)
+    } else if (has_bz) {
+      as.integer(BZScore >= hit_threshold)
+    } else {
+      as.integer(ZScore >= hit_threshold)
+    },
+    Hit = Hit
+  )
+
+score_metric <- if ("Hit" %in% colnames(df)) {
+  "Hit (precomputed)"
+} else if (has_bz) {
+  "BZScore"
+} else {
+  "ZScore"
+}
+
+# Factor ordering
+row_levels <- sort(unique(df$row))
+col_levels <- sprintf("%02d", sort(unique(as.integer(df$col2))))
+df <- df %>%
+  mutate(
+    row = factor(row, levels = row_levels),
+    col2 = factor(col2, levels = col_levels),
+    well_pos = factor(well_pos)
+  )
+# ============================================================
+# 4. GLOBAL SUMMARY STATISTICS
+# ============================================================
+
+# Row summaries
+row_z  <- df %>% group_by(row) %>% summarize(med_z = median(ZScore, na.rm=TRUE), .groups="drop")
+row_bz <- df %>% group_by(row) %>% summarize(med_bz = median(BZScore, na.rm=TRUE), .groups="drop")
+row_h  <- df %>% group_by(row) %>% summarize(hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
+
+# Column summaries
+col_z  <- df %>% group_by(col2) %>% summarize(med_z = median(ZScore, na.rm=TRUE), .groups="drop")
+col_bz <- df %>% group_by(col2) %>% summarize(med_bz = median(BZScore, na.rm=TRUE), .groups="drop")
+col_h  <- df %>% group_by(col2) %>% summarize(hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
+
+# Well position grid
+grid_sum <- df %>%
+  group_by(row, col2) %>%
+  summarize(
+    med_z = median(ZScore, na.rm=TRUE),
+    med_bz = median(BZScore, na.rm=TRUE),
+    hit_sum = sum(Hit, na.rm=TRUE),
+    .groups = "drop"
+  )
+
+# Per-plate summaries
+plate_row_stats <- df %>%
+  group_by(Plate, row) %>%
+  summarize(n = n(), med_z = median(ZScore, na.rm=TRUE), 
+            med_bz = median(BZScore, na.rm=TRUE), hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
+
+plate_col_stats <- df %>%
+  group_by(Plate, col2) %>%
+  summarize(n = n(), med_z = median(ZScore, na.rm=TRUE), 
+            med_bz = median(BZScore, na.rm=TRUE), hit_sum = sum(Hit, na.rm=TRUE), .groups="drop")
+
+# ============================================================
+# 5. STATISTICAL TESTS
+# ============================================================
+
+# Tests on score metrics
+test_row_z  <- mw_test(df, "row", "ZScore")
+test_col_z  <- mw_test(df, "col2", "ZScore")
+test_well_z <- mw_test(df, "well_pos", "ZScore")
+
+if (has_bz) {
+  test_row_bz  <- mw_test(df, "row", "BZScore")
+  test_col_bz  <- mw_test(df, "col2", "BZScore")
+  test_well_bz <- mw_test(df, "well_pos", "BZScore")
+}
+
+# Tests on hit enrichment
+test_row_hit  <- fisher_test(df, "row")
+test_col_hit  <- fisher_test(df, "col2")
+test_well_hit <- fisher_test(df, "well_pos")
+test_plate_Hit <- fisher_test(df, "Plate")
+
+# Extract significant groups
+sig_rows_score <- if (has_bz) {
+  test_row_bz %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(row) %>% as.character()
+} else {
+  test_row_z %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(row) %>% as.character()
+}
+
+sig_cols_score <- if (has_bz) {
+  test_col_bz %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(col2) %>% as.character()
+} else {
+  test_col_z %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(col2) %>% as.character()
+}
+
+sig_wp_score <- if (has_bz) {
+  test_well_bz %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
+} else {
+  test_well_z %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
+}
+
+sig_rows_hit   <- test_row_hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(row) %>% as.character()
+sig_cols_hit   <- test_col_hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(col2) %>% as.character()
+sig_wp_hit     <- test_well_hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(well_pos) %>% as.character()
+sig_plates_hit <- test_plate_Hit %>% filter(!is.na(p_fdr), p_fdr < alpha_qc) %>% pull(Plate) %>% as.character()
+
+# ============================================================
+# 6. VISUALIZATION
+# ============================================================
+
+# Shared y-axis limits
+row_lim <- max(abs(c(row_z$med_z, row_bz$med_bz)), na.rm=TRUE)
+col_lim <- max(abs(c(col_z$med_z, col_bz$med_bz)), na.rm=TRUE)
+row_lim <- ifelse(is.finite(row_lim) && row_lim > 0, row_lim, 1)
+col_lim <- ifelse(is.finite(col_lim) && col_lim > 0, col_lim, 1)
+ylim_row <- c(-row_lim, row_lim)
+ylim_col <- c(-col_lim, col_lim)
+
+
+
+# Row plots
+p_row_z <- bar_shift(row_z, "row", "med_z", "ZScore: global row shift (median)", 
+                     "Row", "Median ZScore", ylim = ylim_row)
+p_row_h <- bar_shift(row_h, "row", "hit_sum", "Hits: global row totals", "Row", "Total hits")
+
+if (has_bz) {
+  p_row_bz <- bar_shift(row_bz, "row", "med_bz", "BZScore: global row shift (median)", 
+                        "Row", "Median BZScore", ylim = ylim_row)
+}
+
+
+# Column plots 
+p_col_z <- bar_shift(col_z, "col2", "med_z", "ZScore: global col shift (median)", 
+                     "Column", "Median ZScore", rotate_x = TRUE, ylim = ylim_col)
+p_col_h <- bar_shift(col_h, "col2", "hit_sum", "Hits: global col totals", 
+                     "Column", "Total hits", rotate_x = TRUE)
+
+if (has_bz) {
+  p_col_bz <- bar_shift(col_bz, "col2", "med_bz", "BZScore: global col shift (median)", 
+                        "Column", "Median BZScore", rotate_x = TRUE, ylim = ylim_col)
+}
+
+# Heatmaps
+p_heat_z <- heatmap_metric(grid_sum, "med_z", "Heatmap: median ZScore by well position", "Median ZScore")
+p_heat_hit <- heatmap_metric(grid_sum, "hit_sum", "Heatmap: total hits by well position", "Total hits")
+
+if (has_bz) {
+  p_heat_bz <- heatmap_metric(grid_sum, "med_bz", "Heatmap: median BZScore by well position", "Median BZScore")
+}
+
+# Plate hits
+p_plate_h <- plot_plate_hits(df, hit_col = "Hit", sig_plates = sig_plates_hit,
+                             title = "Hits: global plate totals (significant plates marked *)")
+
+
+heatmap_theme_clean <- theme(
+  plot.title = element_text(
+    size = 16,
+    face = "bold",
+    hjust = 0
+  ),
+  axis.title = element_text(
+    size = 14,
+    face = "bold"
+  ),
+  axis.text.x = element_text(
+    size = 12,
+    face = "bold"
+  ),
+  axis.text.y = element_text(
+    size = 12,
+    face = "bold"
+  ),
+  legend.title = element_text(
+    size = 14,
+    face = "bold"
+  ),
+  legend.text = element_text(
+    size = 12,
+    face = "bold"
+  )
+)
+paper_div_impact_clean <- function(lims = c(-2, 2), midpoint = 0) {
+
+  scale_fill_gradientn(
+    colours = c(
+      "#E00000",   # strong negative (clean red)
+      "#FF7A00",   # mild negative (orange)
+      "#FFFFFF",   # zero (pure white)
+      "#5A0AA4",   # mild positive (magenta)
+      "#1A0033"    # strong positive (deep purple)
+    ),  
+    values = scales::rescale(
+      c(
+        lims[1],
+        lims[1] + (midpoint - lims[1]) * 0.5,
+        midpoint,
+        midpoint + (lims[2] - midpoint) * 0.5,
+        lims[2]
+      ),
+      from = lims
+    ),
+    limits = lims,
+    oob    = scales::squish
+  )
+}
+
+# Apply to heatmaps
+p_heat_z  <- p_heat_z  + paper_div_impact_clean(lims = c(-2, 2))
+
+if (has_bz) {
+  p_heat_bz <- p_heat_bz + paper_div_impact_clean(lims = c(-2, 2))
+}
+ 
+# 2) Hits map: force ALL non-hits to gray; only hits get color (discrete)
+#    (This requires the hits heatmap to use fill = Hits_bin, shown below.)
+# ---- Hits scale: gray background, colored hits, AND a visible legend ----
+# Make the legend show 0..max_hits, where max_hits = max hits per well (capped if you want)
+ 
+# ---- Apply: set max to max(hits) per well (or cap, if you prefer) ----
+# ---- max hits per well for the legend ----
+# Continuous hits scale: 0 = modern gray; >0 ramps orange -> magenta -> near-black purple
+hit_impact_purple_deeper <- function(max_hits, zero_color = "#F5F5F5") {
+
+  scale_fill_gradientn(
+    colours = c(
+      zero_color,   # 0
+      "#B8AEC9",    # very light neutral violet (less pink)
+      "#5A3E86",    # balanced muted purple
+      "#4A3A73",    # deep plum
+      "#1A0033"     # endpoint (matches Z/BZ max)
+    ),
+    values = scales::rescale(
+      c(0,
+        max_hits * 0.3,
+        max_hits * 0.55,
+        max_hits * 0.8,
+        max_hits),
+      from = c(0, max_hits)
+    ),
+    limits = c(0, max_hits),
+    oob    = scales::squish,
+    guide  = guide_colorbar(
+      title     = "Hits per well",
+      barheight = unit(5, "cm")
+    )
+  )
+}
+ 
+max_hits_well <- max(grid_sum$hit_sum, na.rm = TRUE)
+
+p_heat_hit <- heatmap_metric(
+  grid_sum, "hit_sum",
+  "Heatmap: total hits by well position",
+  "Total hits"
+) +
+  hit_impact_purple_deeper(max_hits = max_hits_well) +
+  scale_y_discrete(limits = rev) +
+  theme(legend.position = "right")
+
+p_heat_z <- p_heat_z +
+  labs(
+    title = "Heatmap: Median Z-Score by Well Position",
+    fill  = "Median Z-Score"
+  ) +
+  heatmap_theme_clean +
+  scale_y_discrete(limits = rev) 
+
+if (has_bz) {
+  p_heat_bz <- p_heat_bz +
+    labs(
+      title = "Heatmap: Median BZ-Score by Well Position",
+      fill  = "Median BZ-Score"
+    ) +
+    heatmap_theme_clean +
+  scale_y_discrete(limits = rev) 
+  }
+
+p_heat_hit <- p_heat_hit +
+  labs(title = "Heatmap: Total Hits by Well Position") +
+  heatmap_theme_clean
+
+# =========================
+row_fig <- if (has_bz) {
+  (p_row_z / p_row_bz / p_row_h) + plot_layout(heights = c(1, 1, 1)) + plot_annotation(title = "Global Row QC")
+} else {
+  (p_row_z / p_row_h) + plot_layout(heights = c(1, 1)) + plot_annotation(title = "Global Row QC")
+}
+
+col_fig <- if (has_bz) {
+  (p_col_z / p_col_bz / p_col_h) + plot_layout(heights = c(1, 1, 1)) + plot_annotation(title = "Global Column QC")
+} else {
+  (p_col_z / p_col_h) + plot_layout(heights = c(1, 1)) + plot_annotation(title = "Global Column QC")
+}
+
+heat_fig <- if (has_bz) {
+  (p_heat_z / p_heat_bz / p_heat_hit) + plot_layout(heights = c(1, 1, 1)) 
+} else {
+  (p_heat_z / p_heat_hit) + plot_layout(heights = c(1, 1)) 
+}
+  
+n_row <- dplyr::n_distinct(df$row)   # or row_z$row
+n_col <- dplyr::n_distinct(df$col2)  # or col_z$col2
+
+h_rc <- if (has_bz) 12 else 9
+
+save_bar_fig_constant_barwidth(row_fig, "QC_ROWS_combined.png", n_bars = n_row, h = h_rc)
+save_bar_fig_constant_barwidth(col_fig, "QC_COLS_combined.png", n_bars = n_col, h = h_rc)
+
+# heatmaps can stay fixed
+
+# Save plots
+save_plot(row_fig,  "QC_ROWS_combined.png",  w = 14, h = if (has_bz) 12 else 9)
+save_plot(col_fig,  "QC_COLS_combined.png",  w = 14, h = if (has_bz) 12 else 9)
+save_plot(heat_fig, "QC_HEAT_combined.png",  w = 12, h = if (has_bz) 12 else 9)
+save_plot(p_plate_h, "QC_PLATES_hits.png", w = 14, h = 7)
+
+# ============================================================
+# 7. QC ANNOTATION FOR HITS
+# ============================================================
+
+type_string <- function(pl, r, c, wp) {
+  out <- character(0)
+
+  if (!is.na(r) && as.character(r) %in% sig_rows_hit)   out <- c(out, "Row enrichment [Hit]")
+  if (!is.na(r) && as.character(r) %in% sig_rows_score) out <- c(out, paste0("Row shift [", score_metric, "]"))
+  if (!is.na(c) && as.character(c) %in% sig_cols_hit)   out <- c(out, "Col enrichment [Hit]")
+  if (!is.na(c) && as.character(c) %in% sig_cols_score) out <- c(out, paste0("Col shift [", score_metric, "]"))
+  if (!is.na(wp) && as.character(wp) %in% sig_wp_hit)   out <- c(out, "Well position enrichment [Hit]")
+  if (!is.na(wp) && as.character(wp) %in% sig_wp_score) out <- c(out, paste0("Well position shift [", score_metric, "]"))
+  if (!is.na(pl) && as.character(pl) %in% sig_plates_hit) out <- c(out, "Plate enrichment [Hit]")
+
+  if (length(out) == 0) return("None")
+  paste(unique(out), collapse = "; ")
+}
+
+hits_df_qc <- df %>%
+  filter(Hit == 1) %>%
+  mutate(
+    Type_of_Error = purrr::pmap_chr(list(Plate, row, col2, well_pos), type_string),
+    Systematic_error = ifelse(Type_of_Error == "None", "No", "Yes"),
+    QC_alpha = alpha_qc
+  ) %>%
+  select(everything(), Systematic_error, Type_of_Error, QC_alpha) %>%
+  select(-any_of(c("Hit", "Hit", "QC_row_score", "QC_col_score", "QC_well_score",
+                   "QC_row_hit", "QC_col_hit", "QC_well_hit", "QC_score_flag", "QC_hit_flag",
+                   "Systematic_plate_error", "Systematic_error_type", "QC_score_metric_used")))
+
+# ============================================================
+# 8. EXPORT RESULTS
+# ============================================================
+
+# Add Hits_QC sheet to original workbook
+orig_wb <- loadWorkbook(fileX)
+hits_sheet_name <- "Hits_QC"
+if (hits_sheet_name %in% names(orig_wb)) removeWorksheet(orig_wb, hits_sheet_name)
+
+addWorksheet(orig_wb, hits_sheet_name)
+hits_out <- hits_df_qc %>% mutate(across(where(is.factor), as.character))
+writeData(orig_wb, hits_sheet_name, hits_out)
+freezePane(orig_wb, hits_sheet_name, firstRow = TRUE)
+addFilter(orig_wb, hits_sheet_name, rows = 1, cols = 1:ncol(hits_out))
+saveWorkbook(orig_wb, fileX, overwrite = TRUE)
+
+# Create comprehensive QC report workbook
+wb <- createWorkbook()
+write_df <- function(sheet_name, x) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, x)
+}
+
+write_df("HITS_with_QC_flags", hits_df_qc)
+write_df("TEST_plate_HitPref_vs_rest", test_plate_Hit)
+write_df("TEST_row_Z_vs_rest", test_row_z)
+write_df("TEST_col_Z_vs_rest", test_col_z)
+write_df("TEST_wellpos_Z_vs_rest", test_well_z)
+
+if (has_bz) {
+  write_df("TEST_row_BZ_vs_rest", test_row_bz)
+  write_df("TEST_col_BZ_vs_rest", test_col_bz)
+  write_df("TEST_wellpos_BZ_vs_rest", test_well_bz)
+}
+
+write_df("TEST_row_Hit_vs_rest", test_row_hit)
+write_df("TEST_col_Hit_vs_rest", test_col_hit)
+write_df("TEST_wellpos_Hit_vs_rest", test_well_hit)
+write_df("global_row_medians", left_join(row_z, row_bz, by="row") %>% left_join(row_h, by="row"))
+write_df("global_col_medians", left_join(col_z, col_bz, by="col2") %>% left_join(col_h, by="col2"))
+write_df("global_grid", grid_sum)
+write_df("plate_row_stats", plate_row_stats)
+write_df("plate_col_stats", plate_col_stats)
+
+
+
+saveWorkbook(wb, file.path(out_dir, "HTS_QC_RESULTS.xlsx"), overwrite = TRUE)
+
+invisible(NULL)
+
+
+
+
+#Overwrite previous hits sheet in original workbook to add QC measures:
+
+sheet_hits <- "Hits"
+
+# 1) Build hits_df2 (hits + QC columns)
+hits_df <- if (assayType == "OFF") {
+  merged_df %>% filter(BZScore >= 2)
+} else {
+  merged_df %>% filter(ZScore >= 2)
+}
+
+hits_df2 <- hits_df %>%
+  left_join(
+    hits_df_qc %>% select(Plate, Well, Systematic_error, QC_alpha),
+    by = c("Plate", "Well")
+  )
+
+# (optional) make factors safe for Excel
+hits_df2 <- hits_df2 %>% mutate(across(where(is.factor), as.character))
+
+# 2) Load the existing workbook and overwrite the Hits sheet
+wb <- loadWorkbook(fileX)
+
+if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
+addWorksheet(wb, sheet_hits)
+
+
+#Order by BZ-Score (descending)
+hits_df2 <- hits_df2 %>% arrange(desc(BZScore))
+
+writeData(wb, sheet_hits, hits_df2, startCol = 1, startRow = 1, colNames = TRUE)
+freezePane(wb, sheet_hits, firstActiveRow = 2)
+addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(hits_df2))
+
+saveWorkbook(wb, fileX, overwrite = TRUE)
+```
+
+
+
+```{r}
+###OPTIONAL###
+# ============================================================
+# Configuration
+# ============================================================
+#Path to previously exported datasheet.
+#save_Location <- "/home/userX/pathsource/"
+
+#If not previously defined:
+fileX   <- "/Users/PathName/CondenScreenV2.xlsx"
+
+#Saves cached smiles, if available, to avoid re-querying PubChem/CACTUS
+CACHE_PATH <- paste0(save_Location, "smiles_cache.tsv")
+# ============================================================
+# 1) Load and merge data
+#Note: the drug/gene/identifier must be name Reference (it automatically will be unless changed)
+df_merged <-  read.xlsx(fileX, sheet = "Hits") %>%
+  mutate(Reference = trimws(as.character(Reference)))
+
+#Determines if reference already has SMILES chemical string available
+has_smiles <- "SMILES" %in% colnames(df_merged) &&
+              any(nzchar(trimws(df_merged$SMILES)), na.rm = TRUE)
+
+df_merged <- df_merged %>%
+  mutate(
+    CAS    = if ("CAS" %in% colnames(.)) as.character(CAS) else NA_character_,
+    SMILES = if ("SMILES" %in% colnames(.)) as.character(SMILES) else NA_character_
+  )
+
+# ============================================================
+# 2) Cache management
+# ============================================================
+smiles_cache <- new.env(parent = emptyenv())
+
+if (file.exists(CACHE_PATH)) {
+  cache_df <- readr::read_tsv(CACHE_PATH, show_col_types = FALSE)
+  if (nrow(cache_df) > 0) {
+    purrr::walk2(cache_df$key, cache_df$value,
+                 ~ assign(.x, .y, envir = smiles_cache))
+  }
+}
+
+cache_get <- function(key) {
+  if (exists(key, envir = smiles_cache, inherits = FALSE)) 
+    get(key, envir = smiles_cache) 
+  else NULL
+}
+
+cache_set <- function(key, value) assign(key, value, envir = smiles_cache)
+
+cache_flush <- function() {
+  keys <- ls(smiles_cache, all.names = TRUE)
+  if (length(keys) > 0) {
+    tibble::tibble(
+      key = keys,
+      value = vapply(keys, function(k) get(k, envir = smiles_cache), character(1))
+    ) %>% readr::write_tsv(CACHE_PATH)
+  }
+}
+
+#Activate the RDKit Python environment
+use_condaenv("rdkit-env", required = TRUE)
+Chem    <- import("rdkit.Chem")
+RDLogger <- import("rdkit.RDLogger")
+RDLogger$DisableLog("rdApp.*")
+
+# ============================================================
+# 3) Identifier cleaning and SMILES retrieval
+# ============================================================
+
+#clean_cas -- experimental: Will try to increase the chance PubChem/CACTUS recognizes your CAS. May need adjustment on case-by-case basis
+clean_cas <- function(x) {
+  
+  if (is.na(x) || !nzchar(trimws(x))) return(NA_character_)
+  x <- trimws(gsub("\\[.*?\\]", "", as.character(x)))
+  parts <- trimws(unlist(strsplit(x, "[,;]")))
+  parts <- parts[nzchar(parts)]
+  if (length(parts) == 0) return(NA_character_)
+  
+  is_cas <- grepl("^\\d{2,7}-\\d{2}-\\d$", parts)
+  if (any(is_cas)) parts[which(is_cas)[1]] else parts[1]
+}
+
+
+#clean SMILES:
+normalize_key <- function(x) {
+  if (is.na(x)) return(NA_character_)
+  x <- as.character(x)
+  x <- gsub("[\t\r\n]", " ", x)
+  x <- trimws(x)
+  tolower(x)
+}
+
+sanitize_smiles <- function(smi) {
+  if (is.na(smi) || !nzchar(trimws(smi))) return(NA_character_)
+  smi <- trimws(smi)
+  smi <- gsub("[\t\r\n ]+", "", smi)
+  smi <- gsub("\\|", ".", smi)
+  smi
+}
+
+#Try parse SMILES into an RDKit molecule, else NULL
+safe_mol <- function(smi) {
+  if (is.na(smi) || !nzchar(trimws(smi))) return(NULL)
+  tryCatch(Chem$MolFromSmiles(trimws(smi)), error = function(e) NULL)
+}
+
+is_valid_smiles <- function(smi) {
+  mol <- safe_mol(smi)
+  !is.null(mol)
+}
+
+
+
+#Returning SMILES:
+#--------
+#Will try to parse PubChem first for SMILES...
+pubchem_smiles <- function(id, namespace = c("name", "rn"), timeout_s = 20) {
+  namespace <- match.arg(namespace)
+  if (is.na(id) || !nzchar(trimws(id))) return(NA_character_)
+  
+  url <- sprintf(
+    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/%s/%s/property/IsomericSMILES,CanonicalSMILES/JSON",
+    namespace, URLencode(id, reserved = TRUE)
+  )
+  
+  resp <- tryCatch(request(url) |> req_timeout(timeout_s) |> req_perform(), 
+                   error = function(e) NULL)
+  if (is.null(resp) || resp_status(resp) >= 400) return(NA_character_)
+  
+  j <- tryCatch(fromJSON(resp_body_string(resp)), error = function(e) NULL)
+  props <- j$PropertyTable$Properties
+  if (is.null(props) || nrow(props) == 0) return(NA_character_)
+  
+  smi <- props$IsomericSMILES[1]
+  if (is.null(smi) || is.na(smi) || !nzchar(smi)) smi <- props$CanonicalSMILES[1]
+  if (is.null(smi) || is.na(smi) || !nzchar(smi)) NA_character_ else smi
+}
+
+
+#... but if fails will resort to CACTUS, NCI Chemical Identifier Resolver: https://cactus.nci.nih.gov/chemical/structure
+cactus_smiles <- function(id, timeout_s = 20) {
+  if (is.na(id) || !nzchar(trimws(id))) return(NA_character_)
+
+  url <- sprintf("https://cactus.nci.nih.gov/chemical/structure/%s/smiles",
+                 URLencode(id, reserved = TRUE))
+
+  for (k in 1:3) {
+    resp <- tryCatch(request(url) |> req_timeout(timeout_s) |> req_perform(),
+                     error = function(e) NULL)
+    if (!is.null(resp) && resp_status(resp) < 400) {
+      smi <- sanitize_smiles(resp_body_string(resp))
+      if (!is.na(smi) && !grepl("not found", smi, ignore.case = TRUE) && is_valid_smiles(smi)) {
+        return(smi)
+      }
+    }
+    Sys.sleep(0.5 * k)
+  }
+  NA_character_
+}
+
+get_smiles <- function(cas, name) {
+  cas1  <- clean_cas(cas)
+  name1 <- if (is.na(name) || !nzchar(trimws(name))) NA_character_ else trimws(name)
+
+  # normalized cache keys
+  key_rn <- if (!is.na(cas1)) paste0("RN:", normalize_key(cas1)) else NULL
+  key_nm <- if (!is.na(name1)) paste0("NM:", normalize_key(name1)) else NULL
+
+  # ---- cache check (use normalized keys only)
+  for (key in c(key_rn, key_nm)) {
+    if (!is.null(key)) {
+      cached <- cache_get(key)
+      if (!is.null(cached) && !identical(cached, "NA") && nzchar(cached)) {
+        # sanitize/validate cached (in case old bad entries exist)
+        cached2 <- sanitize_smiles(cached)
+        if (!is.na(cached2) && is_valid_smiles(cached2)) return(cached2)
+      }
+      if (!is.null(cached) && identical(cached, "NA")) return(NA_character_)
+    }
+  }
+
+  # ---- retrieval
+  smi <- NA_character_
+  if (!is.na(cas1)) smi <- pubchem_smiles(cas1, "rn")
+  if (is.na(smi) && !is.na(name1)) smi <- pubchem_smiles(name1, "name")
+  if (is.na(smi) && !is.na(cas1)) smi <- cactus_smiles(cas1)
+  if (is.na(smi) && !is.na(name1)) smi <- cactus_smiles(name1)
+
+  # ---- sanitize + validate
+  smi <- sanitize_smiles(smi)
+  if (!is.na(smi) && !is_valid_smiles(smi)) smi <- NA_character_
+
+  # ---- cache (normalized keys only)
+  if (!is.null(key_rn)) cache_set(key_rn, ifelse(is.na(smi), "NA", smi))
+  if (!is.null(key_nm)) cache_set(key_nm, ifelse(is.na(smi), "NA", smi))
+
+  smi
+}
+ 
+#--------
+
+# Retrieve SMILES for all compounds
+#Remove whitespace and replace with NA
+df_hits <- df_merged %>%
+  mutate(
+    Reference = if_else(
+      is.na(Reference) | trimws(Reference) == "",
+      NA_character_,
+      as.character(Reference)
+    )
+  )
+
+# Identify rows that actually need lookup 
+need_lookup <- with(
+  df_hits,
+  (is.na(SMILES) | !nzchar(trimws(SMILES))) &
+  !(is.na(CAS) & is.na(Reference))
+)
+
+n_lookup <- sum(need_lookup)
+
+if (n_lookup > 0) {
+
+  idx <- which(need_lookup)
+
+  message("Retrieving SMILES for ", n_lookup, " compounds")
+
+  pb <- progress::progress_bar$new(
+    format = "Compound :current/:total [:bar] :percent | eta: :eta",
+    total  = length(idx),
+    clear  = FALSE,
+    width  = 60
+  )
+
+  df_hits$SMILES[idx] <- vapply(
+    idx,
+    function(i) {
+      pb$tick()
+      get_smiles(df_hits$CAS[i], df_hits$Reference[i])
+    },
+    character(1)
+  )
+
+  cache_flush()
+
+} else {
+  message("All compounds already have SMILES — no lookup performed")
+}
+
+#Diagnostic to determine how well CAS/SMILES search worked
+sum(is.na(df_hits$CAS) & is.na(df_hits$Reference))
+
+
+# ============================================================
+# 4) RDKit setup and molecular processing
+# ============================================================
+
+#Import modules for describing molecular descriptors (e.g., molc. weight), cLogP, Lipinski counts, and safeguard measures.
+Desc <- import("rdkit.Chem.Descriptors")
+Crip <- import("rdkit.Chem.Crippen")
+Lip <- import("rdkit.Chem.Lipinski")
+rdMS <- import("rdkit.Chem.MolStandardize.rdMolStandardize")
+uncharger <- rdMS$Uncharger()
+largest_frag <- rdMS$LargestFragmentChooser()
+
+
+
+#Try to edit SMILES format to reflect canonical SMILES [avoids salt charges, keeps largest fragment, etc.]
+canonicalize_parent <- function(smiles) {
+  if (is.na(smiles) || !nzchar(trimws(smiles))) return(NA_character_)
+  
+  mol <- safe_mol(smiles)
+  if (is.null(mol)) return(NA_character_)
+  
+  mol <- tryCatch(uncharger$uncharge(mol), error = function(e) mol)
+  mol <- tryCatch(largest_frag$choose(mol), error = function(e) mol)
+  
+  tryCatch(Chem$MolToSmiles(mol, canonical = TRUE, kekuleSmiles = FALSE),
+           error = function(e) NA_character_)
+}
+
+# Process SMILES for property calculations
+df_hits <- df_hits %>%
+  as_tibble() %>%
+  mutate(
+    SMILES_used = ifelse(
+      is.na(SMILES) | SMILES == "",
+      NA_character_,
+      vapply(as.character(SMILES), canonicalize_parent, character(1))
+    )
+  )
+# ============================================================
+# 5) Load structural alerts
+# ============================================================
+
+#All credit for the initial chemical alerts goes to Pat Walters.
+#See Pat Walter's GitHub, rd_fitlers, for more information: https://github.com/PatWalters/rd_filters.git
+#The csv file can alternatively be downloaded directly with the rest of the CondenScreen code in https://github.com/SchliekerLab/Condenscreen-v1.1.git
+
+
+
+
+get_alerts <- function(cache_dir = "nuisance_cache",
+                       local_file = "alert_collection_PatWalters.csv") {
+  dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+  f_cache <- file.path(cache_dir, "alert_collection.csv")
+  url <- "https://raw.githubusercontent.com/PatWalters/rd_filters/master/rd_filters/data/alert_collection.csv"
+
+  # ---- Prefer local file, then cached file, else download ----
+  if (file.exists(local_file)) {
+    message("Using local alert file: ", local_file)
+    al <- read.csv(local_file, stringsAsFactors = FALSE)
+  } else if (file.exists(f_cache)) {
+    message("Using cached alert file: ", f_cache)
+    al <- read.csv(f_cache, stringsAsFactors = FALSE)
+  } else {
+    message("Downloading alert collection from GitHub...")
+    download.file(url, f_cache, mode = "wb")
+    al <- read.csv(f_cache, stringsAsFactors = FALSE)
+  }
+
+  # ---- Detect column names (robust to schema changes) ----
+  nms <- names(al)
+
+  smarts_col <- nms[grep("smarts", nms, ignore.case = TRUE)][1]
+
+  # rule_set numeric (e.g., 2,3,4...) if present
+  rule_set_col <- nms[grep("^rule.?set$|rule_set", nms, ignore.case = TRUE)][1]
+
+  # rule_set_name (e.g., PAINS, Glaxo, GSK...) if present
+  set_name_col <- nms[grep("rule.?set.?name|set_name|ruleset_name|rule_set_name", nms, ignore.case = TRUE)][1]
+
+  # rule_id numeric
+  id_col <- nms[grep("^rule.?id$|rule_id", nms, ignore.case = TRUE)][1]
+
+  # description/name field (human readable), best-effort
+  desc_col <- nms[grep("description|desc|name|alert_name|label", nms, ignore.case = TRUE)][1]
+
+  if (is.na(smarts_col) || is.na(id_col) || (is.na(rule_set_col) && is.na(set_name_col))) {
+    stop(
+      "Could not detect required columns in alert CSV. Found columns: ",
+      paste(nms, collapse = ", ")
+    )
+  }
+
+  # ---- Normalize ----
+  alerts <- dplyr::as_tibble(al) %>%
+    dplyr::transmute(
+      rule_set      = if (!is.na(rule_set_col)) as.integer(.data[[rule_set_col]]) else NA_integer_,
+      rule_set_name = if (!is.na(set_name_col)) as.character(.data[[set_name_col]]) else NA_character_,
+      rule_id       = suppressWarnings(as.integer(.data[[id_col]])),
+      description   = if (!is.na(desc_col)) as.character(.data[[desc_col]]) else NA_character_,
+      smarts        = as.character(.data[[smarts_col]])
+    ) %>%
+    dplyr::filter(!is.na(smarts), nzchar(smarts)) %>%
+    dplyr::filter(!is.na(rule_id)) %>%
+    dplyr::mutate(
+      # if rule_set_name missing, fall back to rule_set as text
+      rule_set_name = dplyr::if_else(
+        is.na(rule_set_name) | !nzchar(rule_set_name),
+        ifelse(!is.na(rule_set), paste0("RuleSet_", rule_set), "UnknownSet"),
+        rule_set_name
+      ),
+      # stable ID uses numeric rule_set if available; else build stable-ish id from set_name
+      alert_id = dplyr::if_else(
+        !is.na(rule_set),
+        paste0(rule_set, ":", rule_id),
+        paste0(rule_set_name, ":", rule_id)
+      ),
+      # human-readable label
+      label = dplyr::if_else(
+        !is.na(description) & nzchar(description),
+        paste0(alert_id, " | ", rule_set_name, " | ", description),
+        paste0(alert_id, " | ", rule_set_name)
+      )
+    )
+
+  # ---- Split and compile patterns ----
+  split(alerts, alerts$rule_set_name) %>%
+    purrr::map(function(d) {
+      tibble::tibble(
+        rule_set_name = d$rule_set_name[1],
+        rule_set      = d$rule_set[1],
+        rule_id       = d$rule_id,
+        alert_id      = d$alert_id,
+        description   = d$description,
+        smarts        = d$smarts,
+        label         = d$label,
+        patt          = purrr::map(d$smarts, ~ tryCatch(Chem$MolFromSmarts(.x), error = function(e) NULL))
+      ) %>%
+        dplyr::filter(!purrr::map_lgl(patt, is.null))
+    })
+}
+
+compiled_sets <- get_alerts()
+
+flag_molecule <- function(smi, compiled_sets) {
+  mol <- safe_mol(smi)
+  if (is.null(mol)) return("")
+  
+  hits <- c()
+  
+  for (set_name in names(compiled_sets)) {
+    tbl <- compiled_sets[[set_name]]
+    
+    matched <- purrr::map_lgl(tbl$patt, ~ mol$HasSubstructMatch(.x))
+    
+    if (any(matched)) {
+      hits <- c(hits, tbl$label[matched])
+    }
+  }
+  
+  if (length(hits) == 0) {
+    ""
+  } else {
+    paste(unique(hits), collapse = " | ")
+  }
+}
+
+
+calc_lipinski <- function(smi) {
+  mol <- safe_mol(smi)
+  if (is.null(mol)) {
+    return(tibble::tibble(MW = NA_real_, LogP = NA_real_, HBD = NA_real_, 
+                          HBA = NA_real_, Lipinski = NA_character_, 
+                          Lipinski_Passed = NA_character_, Lipinski_Failed = NA_character_))
+  }
+  
+  MW <- as.numeric(Desc$MolWt(mol))
+  LogP <- as.numeric(Crip$MolLogP(mol))
+  HBD <- as.numeric(Lip$NumHDonors(mol))
+  HBA <- as.numeric(Lip$NumHAcceptors(mol))
+  
+  passed <- c(
+    if (!is.na(MW) && MW <= 500) "MW<=500",
+    if (!is.na(LogP) && LogP <= 5) "LogP<=5",
+    if (!is.na(HBD) && HBD <= 5) "HBD<=5",
+    if (!is.na(HBA) && HBA <= 10) "HBA<=10"
+  )
+  
+  failed <- c(
+    if (!is.na(MW) && MW > 500) "MW>500",
+    if (!is.na(LogP) && LogP > 5) "LogP>5",
+    if (!is.na(HBD) && HBD > 5) "HBD>5",
+    if (!is.na(HBA) && HBA > 10) "HBA>10"
+  )
+  
+  tibble::tibble(
+    MW = MW, LogP = LogP, HBD = HBD, HBA = HBA,
+    Lipinski = if (length(failed) == 0) "Pass" else "Fail",
+    Lipinski_Passed = paste(passed, collapse = ", "),
+    Lipinski_Failed = paste(failed, collapse = ", ")
+  )
+}
+# ============================================================
+# 6) Compute properties for unique SMILES
+# ============================================================
+unique_smiles <- df_hits %>%
+  filter(!is.na(SMILES_used), SMILES_used != "") %>%
+  distinct(SMILES_used)
+
+cat("Computing properties for", nrow(unique_smiles), "unique SMILES...\n")
+smis <- unique_smiles$SMILES_used
+n <- length(smis)
+
+pb <- progress::progress_bar$new(
+  format = "RDKit [:bar] :current/:total :percent | eta: :eta",
+  total  = n,
+  clear  = FALSE,
+  width  = 60
+)
+
+properties_list <- vector("list", n)
+
+for (i in seq_len(n)) {
+  pb$tick()
+
+  smi <- smis[i]
+
+  flags <- flag_molecule(smi, compiled_sets)
+  props <- calc_lipinski(smi)
+
+  properties_list[[i]] <- cbind(
+    tibble::tibble(SMILES_used = smi, alert_flags = flags),
+    props
+  )
+}
+
+properties_tbl <- dplyr::bind_rows(properties_list)
+
+# ============================================================
+# 7) Join properties and calculate risk scores
+# ============================================================
+# Chemical Liability Scoring Framework (Max-Based Tier System)
+#
+# This scoring system assigns compounds to liability tiers based on the
+# highest-severity flag present rather than summing penalties. This avoids
+# artificial inflation when multiple related alerts are triggered.
+# The PAINS/MLSMR/BMS/GSK/Glaxo/LINT/Dundee/Inpharmatica/SureChEMBL are based on the the ChEMBL database and Pat Walters work.
+# See https://github.com/PatWalters/rd_filters.git
+
+# Tier definitions:
+
+#   Score 10 (ELEVATED):
+#     - PAINS compounds 
+#     - Cytotoxicity (≥25% viability loss)
+#
+#   Score 5 (MODERATE):
+#     - Industry structural alerts (MLSMR / NIH structural alerts, BMS, GSK, Glaxo, LINT, Dundee)
+#     - tdTomato reporter suppression (≥25% loss)
+#
+#   Score 2 (MINOR):
+#     - Lipinski rule-of-five violations
+#     - Inpharmatica / SureChEMBL alerts
+
+# Risk categories:
+#   10  -> "ELEVATED"
+#   5   -> "MODERATE"
+#   2   -> "MINOR"
+#   0   -> "CLEAN"
+
+# -------------------------------------------------------------------------
+
+df_final <- df_hits %>%
+  left_join(properties_tbl, by = "SMILES_used", suffix = c(".old", "")) %>%
+  select(-ends_with(".old")) %>%
+  mutate(
+    Viability = if ("Viability" %in% names(.)) Viability else NA_real_,
+    TdTomato  = if ("tdTomato_Diff" %in% names(.)) tdTomato_Diff <= -25 else FALSE,
+    Cytotoxic = !is.na(Viability) & (Viability <= -25),
+
+    has_smiles = !is.na(SMILES_used) & nzchar(trimws(SMILES_used)),
+    flags = if_else(has_smiles, coalesce(alert_flags, ""), ""),
+
+    # --- Flag categories ---
+    High_Flag = grepl("PAINS", flags, ignore.case = TRUE) | Cytotoxic,
+
+    Moderate_Flag = grepl("BMS|GLAXO|GSK|LINT|DUNDEE|MLSMR|NIH", flags, ignore.case = TRUE) | TdTomato,
+
+    Mild_Flag = grepl("INPHARMATICA|SURECHEMBL", flags, ignore.case = TRUE) |
+                (!is.na(Lipinski_Failed) & Lipinski_Failed > 0),
+
+    # --- Max-based score ---
+    AlertScore = pmax(
+      if_else(High_Flag, 10L, 0L),
+      if_else(Moderate_Flag, 5L, 0L),
+      if_else(Mild_Flag, 2L, 0L)
+    )
+  ) %>%
+  mutate(
+    Risk = case_when(
+      !has_smiles        ~ "UNKNOWN",
+      AlertScore >= 10   ~ "ELEVATED",
+      AlertScore >= 5    ~ "MODERATE",
+      AlertScore >= 2    ~ "MINOR",
+      TRUE               ~ "CLEAN"
+    )
+  )
+ 
+ 
+chem_cols_chr <- c("flags", "Lipinski", "Lipinski_Failed")
+chem_cols_num <- c("AlertScore", "MW", "LogP", "HBD", "HBA")
+chem_cols_lgl <- c("PAINS_NIH_Flagged", "Industry_Flagged", "Other_Flagged")
+
+df_final <- df_final %>%
+  mutate(
+    across(any_of(chem_cols_num), ~ if_else(has_smiles, .x, NA_real_)),
+    across(any_of(chem_cols_chr), ~ if_else(has_smiles, .x, NA_character_)),
+    across(any_of(chem_cols_lgl), ~ if_else(has_smiles, .x, NA))
+  ) %>%
+  select(-has_smiles)
+
+
+#Select important columns for exporting:
+df_final <- df_final %>%
+  select(
+    Plate, Well, BZScore, Viability, PlateZPrimeScore,
+    PercentEffect, AvgFoci, CellCountPercentDiff, CellCount, ZScore,
+    BScore, AssayType, Average_foci_perCell, Normalized_Effect, Reference,
+    CAS,
+    Systematic_error, QC_alpha,
+    Risk, Lipinski, TdTomato, Cytotoxic,
+    MW, LogP, HBD, HBA,
+    Lipinski_Failed,
+    SMILES_used, AlertScore, alert_flags
+  )
+
+# ============================================================
+# 8) Write back to Excel
+# ============================================================
+
+#Overwrite previous hits sheet in original workbook to add chemical triage labels:
+
+sheet_hits <- "Hits"
+
+# (optional) make factors safe for Excel
+df_final <- df_final %>% mutate(across(where(is.factor), as.character))
+
+# 2) Load the existing workbook and overwrite the Hits sheet
+wb <- loadWorkbook(fileX)
+
+
+if (sheet_hits %in% names(wb)) removeWorksheet(wb, sheet_hits)
+addWorksheet(wb, sheet_hits)
+
+#Order by BZ-Score (descending)
+df_final <- df_final %>% arrange(desc(BZScore))
+writeData(wb, sheet_hits, df_final, startCol = 1, startRow = 1, colNames = TRUE)
+
+freezePane(wb, sheet_hits, firstActiveRow = 2)
+addFilter(wb, sheet_hits, rows = 1, cols = 1:ncol(df_final))
+
+# Desired sheets (in order)
+new_order <- c("Hits", "Combined Analysis", "Plate Statistics", "Controls")
+
+# Remove unwanted sheets
+for (sh in setdiff(names(wb), new_order)) {
+  removeWorksheet(wb, sh)
+}
+
+# Reorder by matching positions
+worksheetOrder(wb) <- match(new_order, names(wb))
+
+
+saveWorkbook(wb, fileX, overwrite = TRUE)
+
+```
+
+
